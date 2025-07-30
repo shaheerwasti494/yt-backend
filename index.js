@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const { exec } = require("child_process");
 const cors = require("cors");
@@ -28,47 +27,55 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // 1) All video formats (progressive + adaptive)
+    // 1) Video formats (progressive + adaptive)
     const videoFormats = formats
-      .filter(f => f.vcodec && f.vcodec !== "none" && (f.ext === "mp4" || f.ext === "webm"))
+      .filter(f =>
+        f.vcodec && f.vcodec !== "none" &&
+        (f.ext === "mp4" || f.ext === "webm") // keep mp4/webm
+      )
       .map(f => ({
         format_id:  f.format_id,
         extension:  f.ext,
-        resolution: f.height ? `${f.height}p` : "unknown",
-        fps:        f.fps || null,
+        resolution: f.height ? `${f.height}p` : "audio-only",
+        protocol:   f.protocol,           // e.g. "https", "m3u8_native", "dash"
         has_audio:  !!(f.acodec && f.acodec !== "none"),
-        vcodec:     f.vcodec,
-        acodec:     f.acodec || null,
-        bandwidth:  f.tbr || null,
+        bandwidth:  f.tbr || f.abr || null,
         url:        f.url
       }))
       .filter((fmt, i, arr) =>
         arr.findIndex(x =>
           x.resolution === fmt.resolution &&
           x.extension  === fmt.extension &&
-          x.has_audio  === fmt.has_audio
+          x.protocol   === fmt.protocol
         ) === i
       )
-      .sort((a, b) => (parseInt(a.resolution) || 0) - (parseInt(b.resolution) || 0));
+      .sort((a, b) => {
+        const ha = parseInt(a.resolution)||0;
+        const hb = parseInt(b.resolution)||0;
+        return ha - hb;
+      });
 
-    // 2) Best audio-only formats
+    // 2) Audio-only formats
     const audioFormats = formats
-      .filter(f => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
+      .filter(f =>
+        (!f.vcodec || f.vcodec === "none") &&
+        f.acodec && f.acodec !== "none"
+      )
       .map(f => ({
         format_id: f.format_id,
         extension: f.ext,
-        acodec:    f.acodec,
+        protocol:  f.protocol,
         bitrate:   f.abr || null,
         url:       f.url
       }))
-      // dedupe by bitrate+ext
       .filter((fmt, i, arr) =>
         arr.findIndex(x =>
           x.bitrate === fmt.bitrate &&
-          x.extension === fmt.extension
+          x.extension === fmt.extension &&
+          x.protocol  === fmt.protocol
         ) === i
       )
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      .sort((a, b) => (b.bitrate||0) - (a.bitrate||0));
 
     if (!videoFormats.length) {
       return res.status(404).json({ error: "No video formats found" });
