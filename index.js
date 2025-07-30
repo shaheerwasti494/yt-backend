@@ -13,7 +13,6 @@ app.get("/stream", (req, res) => {
     return res.status(400).json({ error: "Missing video ID" });
   }
 
-  // 1) Get full metadata
   const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
 
   exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
@@ -32,37 +31,38 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // 2) Build videoFormats array
+    // ✅ Fix grouping to avoid audio-only in videoFormats
     const videoFormats = formats
-      .filter(f =>
-        f.vcodec && f.vcodec !== "none" && f.ext === "mp4" ||
-        f.vcodec && f.vcodec !== "none" && f.ext === "webm"
+      .filter(
+        f =>
+          f.vcodec && f.vcodec !== "none" &&
+          (f.ext === "mp4" || f.ext === "webm")
       )
       .map(f => ({
         format_id:  f.format_id,
         extension:  f.ext,
-        resolution: f.height ? `${f.height}p` : "audio-only",
+        resolution: f.height ? `${f.height}p` : "unknown",
         fps:        f.fps || null,
-        has_audio:  !!f.acodec && f.acodec !== "none",
+        has_audio:  !!(f.acodec && f.acodec !== "none"),
         vcodec:     f.vcodec,
         acodec:     f.acodec || null,
         bandwidth:  f.tbr || null,
         url:        f.url
       }))
-      // dedupe by resolution+ext+has_audio to avoid exact duplicates
       .filter((fmt, i, arr) =>
         arr.findIndex(x =>
           x.resolution === fmt.resolution &&
           x.extension  === fmt.extension &&
           x.has_audio  === fmt.has_audio
         ) === i
-      );
+      )
+      .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution)); // sort ascending
 
-    // 3) Build audioFormats array
     const audioFormats = formats
-      .filter(f =>
-        (!f.vcodec || f.vcodec === "none") &&
-        f.acodec && f.acodec !== "none"
+      .filter(
+        f =>
+          (!f.vcodec || f.vcodec === "none") &&
+          f.acodec && f.acodec !== "none"
       )
       .map(f => ({
         format_id: f.format_id,
@@ -71,21 +71,18 @@ app.get("/stream", (req, res) => {
         bandwidth: f.abr || null,
         url:       f.url
       }))
-      // dedupe by bitrate+ext
       .filter((fmt, i, arr) =>
         arr.findIndex(x =>
           x.bandwidth === fmt.bandwidth &&
           x.extension === fmt.extension
         ) === i
       )
-      // sort descending by bitrate
       .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
 
     if (!videoFormats.length && !audioFormats.length) {
       return res.status(404).json({ error: "No formats found" });
     }
 
-    // 4) Send everything to the client
     res.json({
       videoFormats,
       audioFormats
