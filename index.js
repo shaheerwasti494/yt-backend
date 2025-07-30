@@ -31,38 +31,43 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // ✅ Fix grouping to avoid audio-only in videoFormats
+    // ✅ Only progressive video (has both audio + video and is non-adaptive)
     const videoFormats = formats
       .filter(
         f =>
           f.vcodec && f.vcodec !== "none" &&
-          (f.ext === "mp4" || f.ext === "webm")
+          f.acodec && f.acodec !== "none" && // has audio
+          (f.ext === "mp4" || f.ext === "webm") &&
+          f.protocol !== "m3u8" &&           // exclude HLS
+          f.protocol !== "dash"              // exclude DASH
       )
       .map(f => ({
         format_id:  f.format_id,
         extension:  f.ext,
         resolution: f.height ? `${f.height}p` : "unknown",
         fps:        f.fps || null,
-        has_audio:  !!(f.acodec && f.acodec !== "none"),
+        has_audio:  true,
         vcodec:     f.vcodec,
-        acodec:     f.acodec || null,
+        acodec:     f.acodec,
         bandwidth:  f.tbr || null,
         url:        f.url
       }))
       .filter((fmt, i, arr) =>
         arr.findIndex(x =>
           x.resolution === fmt.resolution &&
-          x.extension  === fmt.extension &&
-          x.has_audio  === fmt.has_audio
+          x.extension  === fmt.extension
         ) === i
       )
-      .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution)); // sort ascending
+      .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
 
+    // ✅ Audio-only formats
     const audioFormats = formats
       .filter(
         f =>
           (!f.vcodec || f.vcodec === "none") &&
-          f.acodec && f.acodec !== "none"
+          f.acodec && f.acodec !== "none" &&
+          f.protocol !== "m3u8" &&
+          f.protocol !== "dash"
       )
       .map(f => ({
         format_id: f.format_id,
