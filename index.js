@@ -31,39 +31,41 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-   const combinedFormats = formats
-  .filter(f =>
-    f.vcodec && f.vcodec !== "none" &&
-    (f.ext === "mp4" || f.ext === "webm") &&
-    f.protocol !== "m3u8" &&
-    f.protocol !== "dash"
-  )
-  .map(f => ({
-    format_id:  f.format_id,
-    extension:  f.ext,
-    resolution: f.height ? `${f.height}p` : "unknown",
-    fps:        f.fps || null,
-    vcodec:     f.vcodec,
-    acodec:     f.acodec && f.acodec !== "none" ? f.acodec : null,
-    bandwidth:  f.tbr || null,
-    url:        f.url,
-    has_audio:  f.acodec && f.acodec !== "none"
-  }))
-  .filter((fmt, i, arr) =>
-    arr.findIndex(x =>
-      x.resolution === fmt.resolution &&
-      x.extension  === fmt.extension
-    ) === i
-  )
-  .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
+    // ✅ Include both progressive and adaptive formats
+    const allFormats = formats
+      .filter(f =>
+        f.vcodec && f.vcodec !== "none" &&
+        (f.ext === "mp4" || f.ext === "webm") &&
+        f.protocol !== "m3u8" && // exclude HLS playlists
+        f.protocol !== "dash"   // exclude DASH manifests (we provide direct URLs)
+      )
+      .map(f => ({
+        format_id:  f.format_id,
+        extension:  f.ext,
+        resolution: f.height ? `${f.height}p` : "unknown",
+        fps:        f.fps || null,
+        vcodec:     f.vcodec,
+        acodec:     f.acodec && f.acodec !== "none" ? f.acodec : null,
+        bandwidth:  f.tbr || null,
+        url:        f.url,
+        has_audio:  f.acodec && f.acodec !== "none"
+      }))
+      // avoid duplicate resolutions
+      .filter((fmt, i, arr) =>
+        arr.findIndex(x =>
+          x.resolution === fmt.resolution &&
+          x.extension === fmt.extension
+        ) === i
+      )
+      // sort by height (ascending)
+      .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
 
-
-    if (!combinedFormats.length) {
-      return res.status(404).json({ error: "No video+audio formats found" });
+    if (!allFormats.length) {
+      return res.status(404).json({ error: "No video formats found" });
     }
 
     res.json({
-      videoFormats: combinedFormats
+      videoFormats: allFormats
     });
   });
 });
