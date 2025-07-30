@@ -11,10 +11,9 @@ app.get("/stream", (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Missing video ID" });
 
-  // 1) dump full info as JSON
   const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
 
-  exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+  exec(cmd, { maxBuffer: 15 * 1024 * 1024 }, (err, stdout) => {
     if (err) {
       console.error("yt-dlp error:", err);
       return res.status(500).json({ error: "Failed to fetch formats" });
@@ -28,27 +27,40 @@ app.get("/stream", (req, res) => {
       return res.status(500).json({ error: "Invalid JSON from yt-dlp" });
     }
 
-    // 2) filter for MP4 with AVC video + AAC audio
-    const choices = (info.formats || [])
+    const formats = info.formats || [];
+
+    // 🎥 Video formats (MP4, AVC)
+    const videoFormats = formats
       .filter(f =>
-        f.ext === "mp4"
-        && f.vcodec  && f.vcodec.includes("avc")
-        && f.acodec && f.acodec.includes("mp4a")
-        && f.width && f.height // ensure it’s video+audio
+        f.ext === "mp4" &&
+        f.vcodec && f.vcodec.includes("avc") &&
+        f.width && f.height // ensures it's a video
       )
-      // 3) map to only the fields you need
       .map(f => ({
-        format_id:  f.format_id,
+        format_id: f.format_id,
         resolution: `${f.height}p`,
-        url:        f.url
+        url: f.url,
+        has_audio: !!f.acodec && f.acodec !== "none",
+        has_video: !!f.vcodec && f.vcodec !== "none"
       }));
 
-    if (choices.length === 0) {
-      return res.status(404).json({ error: "No suitable MP4 formats found" });
+    // 🔊 Best audio-only stream (AAC)
+    const audioFormat = formats.find(f =>
+      f.ext === "m4a" &&
+      f.acodec && f.acodec.includes("mp4a")
+    );
+
+    if (videoFormats.length === 0) {
+      return res.status(404).json({ error: "No video formats found" });
     }
 
-    // return array of qualities
-    res.json({ formats: choices });
+    res.json({
+      videoFormats,
+      audioFormat: audioFormat ? {
+        format_id: audioFormat.format_id,
+        url: audioFormat.url
+      } : null
+    });
   });
 });
 
