@@ -31,8 +31,8 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // ✅ Only progressive video (has both audio + video and is non-adaptive)
-    const videoFormats = formats
+    // ✅ Filter only progressive (video + audio) formats
+    const combinedFormats = formats
       .filter(
         f =>
           f.vcodec && f.vcodec !== "none" &&
@@ -46,7 +46,6 @@ app.get("/stream", (req, res) => {
         extension:  f.ext,
         resolution: f.height ? `${f.height}p` : "unknown",
         fps:        f.fps || null,
-        has_audio:  true,
         vcodec:     f.vcodec,
         acodec:     f.acodec,
         bandwidth:  f.tbr || null,
@@ -60,37 +59,12 @@ app.get("/stream", (req, res) => {
       )
       .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
 
-    // ✅ Audio-only formats
-    const audioFormats = formats
-      .filter(
-        f =>
-          (!f.vcodec || f.vcodec === "none") &&
-          f.acodec && f.acodec !== "none" &&
-          f.protocol !== "m3u8" &&
-          f.protocol !== "dash"
-      )
-      .map(f => ({
-        format_id: f.format_id,
-        extension: f.ext,
-        acodec:    f.acodec,
-        bandwidth: f.abr || null,
-        url:       f.url
-      }))
-      .filter((fmt, i, arr) =>
-        arr.findIndex(x =>
-          x.bandwidth === fmt.bandwidth &&
-          x.extension === fmt.extension
-        ) === i
-      )
-      .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
-
-    if (!videoFormats.length && !audioFormats.length) {
-      return res.status(404).json({ error: "No formats found" });
+    if (!combinedFormats.length) {
+      return res.status(404).json({ error: "No video+audio formats found" });
     }
 
     res.json({
-      videoFormats,
-      audioFormats
+      videoFormats: combinedFormats
     });
   });
 });
