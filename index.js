@@ -13,10 +13,10 @@ app.get("/stream", (req, res) => {
     return res.status(400).json({ error: "Missing video ID" });
   }
 
-  // 1) Fetch full JSON metadata
+  // 1) Get full metadata
   const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
 
-  exec(cmd, { maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
+  exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
     if (err) {
       console.error("yt-dlp error:", err);
       return res.status(500).json({ error: "Failed to fetch formats" });
@@ -32,38 +32,64 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // 2) Collect all MP4 AVC video streams
+    // 2) Build videoFormats array
     const videoFormats = formats
       .filter(f =>
-        f.ext === "mp4" &&
-        f.vcodec && f.vcodec.includes("avc") &&
-        f.width && f.height
+        f.vcodec && f.vcodec !== "none" && f.ext === "mp4" ||
+        f.vcodec && f.vcodec !== "none" && f.ext === "webm"
       )
-      // map to normalized objects
       .map(f => ({
-        format_id: f.format_id,
-        resolution: `${f.height}p`,
-        url: f.url,
-        has_audio: !!f.acodec && f.acodec !== "none"
+        format_id:  f.format_id,
+        extension:  f.ext,
+        resolution: f.height ? `${f.height}p` : "audio-only",
+        fps:        f.fps || null,
+        has_audio:  !!f.acodec && f.acodec !== "none",
+        vcodec:     f.vcodec,
+        acodec:     f.acodec || null,
+        bandwidth:  f.tbr || null,
+        url:        f.url
       }))
-      // dedupe by resolution, keep first occurrence
-      .filter((fmt, idx, arr) =>
-        arr.findIndex(x => x.resolution === fmt.resolution) === idx
+      // dedupe by resolution+ext+has_audio to avoid exact duplicates
+      .filter((fmt, i, arr) =>
+        arr.findIndex(x =>
+          x.resolution === fmt.resolution &&
+          x.extension  === fmt.extension &&
+          x.has_audio  === fmt.has_audio
+        ) === i
       );
 
-    // 3) Pick best AAC audio-only stream
-    const audioFormatObj = formats.find(f =>
-      f.ext === "m4a" &&
-      f.acodec && f.acodec.includes("mp4a")
-    );
-    const audioFormat = audioFormatObj ? audioFormatObj.url : null;
+    // 3) Build audioFormats array
+    const audioFormats = formats
+      .filter(f =>
+        (!f.vcodec || f.vcodec === "none") &&
+        f.acodec && f.acodec !== "none"
+      )
+      .map(f => ({
+        format_id: f.format_id,
+        extension: f.ext,
+        acodec:    f.acodec,
+        bandwidth: f.abr || null,
+        url:       f.url
+      }))
+      // dedupe by bitrate+ext
+      .filter((fmt, i, arr) =>
+        arr.findIndex(x =>
+          x.bandwidth === fmt.bandwidth &&
+          x.extension === fmt.extension
+        ) === i
+      )
+      // sort descending by bitrate
+      .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
 
-    if (videoFormats.length === 0) {
-      return res.status(404).json({ error: "No video formats found" });
+    if (!videoFormats.length && !audioFormats.length) {
+      return res.status(404).json({ error: "No formats found" });
     }
 
-    // 4) Send JSON
-    res.json({ videoFormats, audioFormat });
+    // 4) Send everything to the client
+    res.json({
+      videoFormats,
+      audioFormats
+    });
   });
 });
 
