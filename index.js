@@ -31,33 +31,32 @@ app.get("/stream", (req, res) => {
 
     const formats = info.formats || [];
 
-    // ✅ Filter only progressive (video + audio) formats
-    const combinedFormats = formats
-      .filter(
-        f =>
-          f.vcodec && f.vcodec !== "none" &&
-          f.acodec && f.acodec !== "none" && // has audio
-          (f.ext === "mp4" || f.ext === "webm") &&
-          f.protocol !== "m3u8" &&           // exclude HLS
-          f.protocol !== "dash"              // exclude DASH
-      )
-      .map(f => ({
-        format_id:  f.format_id,
-        extension:  f.ext,
-        resolution: f.height ? `${f.height}p` : "unknown",
-        fps:        f.fps || null,
-        vcodec:     f.vcodec,
-        acodec:     f.acodec,
-        bandwidth:  f.tbr || null,
-        url:        f.url
-      }))
-      .filter((fmt, i, arr) =>
-        arr.findIndex(x =>
-          x.resolution === fmt.resolution &&
-          x.extension  === fmt.extension
-        ) === i
-      )
-      .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
+   const combinedFormats = formats
+  .filter(f =>
+    f.vcodec && f.vcodec !== "none" &&
+    (f.ext === "mp4" || f.ext === "webm") &&
+    f.protocol !== "m3u8" &&
+    f.protocol !== "dash"
+  )
+  .map(f => ({
+    format_id:  f.format_id,
+    extension:  f.ext,
+    resolution: f.height ? `${f.height}p` : "unknown",
+    fps:        f.fps || null,
+    vcodec:     f.vcodec,
+    acodec:     f.acodec && f.acodec !== "none" ? f.acodec : null,
+    bandwidth:  f.tbr || null,
+    url:        f.url,
+    has_audio:  f.acodec && f.acodec !== "none"
+  }))
+  .filter((fmt, i, arr) =>
+    arr.findIndex(x =>
+      x.resolution === fmt.resolution &&
+      x.extension  === fmt.extension
+    ) === i
+  )
+  .sort((a, b) => parseInt(a.resolution) - parseInt(b.resolution));
+
 
     if (!combinedFormats.length) {
       return res.status(404).json({ error: "No video+audio formats found" });
