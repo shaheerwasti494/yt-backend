@@ -3,21 +3,30 @@ const express = require("express");
 const { exec } = require("child_process");
 const cors = require("cors");
 const NodeCache = require("node-cache");
+const util = require("util");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-// Create cache with 5 minute TTL
-const cache = new NodeCache({ stdTTL: 300 });
+const cache = new NodeCache({ stdTTL: 300 }); // 5 min cache
 
-// ------------------ /stream endpoint (JSON) ------------------
+// Helper: promisified exec
+const execPromise = (cmd) => {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve({ stdout });
+    });
+  });
+};
+
+// ------------------ /stream ------------------
 app.get("/stream", (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Missing video ID" });
 
-  // Check cache
   const cached = cache.get(`stream_${id}`);
   if (cached) {
     console.log(`Cache hit for /stream ${id}`);
@@ -78,12 +87,12 @@ app.get("/stream", (req, res) => {
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
     const result = { videoFormats, audioFormats };
-    cache.set(`stream_${id}`, result); // Cache it
+    cache.set(`stream_${id}`, result);
     res.json(result);
   });
 });
 
-// ------------------ /stream480 endpoint (480p + audio+video only) ------------------
+// ------------------ /stream480 ------------------
 app.get("/stream480", (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Missing video ID" });
@@ -124,16 +133,9 @@ app.get("/stream480", (req, res) => {
       return res.status(404).json({ error: "No merged (audio+video) MP4 found" });
     }
 
-    // Try to find exactly 480p or closest below it
-    let format = merged
-      .filter(f => f.height <= 480)
-      .sort((a, b) => b.height - a.height)[0];
-
-    // If not found, use the lowest available above 480p
+    let format = merged.filter(f => f.height <= 480).sort((a, b) => b.height - a.height)[0];
     if (!format) {
-      format = merged
-        .filter(f => f.height > 480)
-        .sort((a, b) => a.height - b.height)[0];
+      format = merged.filter(f => f.height > 480).sort((a, b) => a.height - b.height)[0];
     }
 
     if (!format || !format.url) {
@@ -141,11 +143,12 @@ app.get("/stream480", (req, res) => {
     }
 
     console.log(`✅ Redirecting to ${format.height}p merged MP4`);
-    cache.set(cacheKey, format.url); // cache the final URL
+    cache.set(cacheKey, format.url);
     res.redirect(format.url);
   });
 });
-// ------------------ /streamMp4 endpoint (Fast 480p+audio MP4 using yt-dlp -g) ------------------
+
+// ------------------ /streamMp4 ------------------
 app.get("/streamMp4", (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Missing video ID" });
@@ -177,11 +180,10 @@ app.get("/streamMp4", (req, res) => {
   });
 });
 
-// ---------- /filterPlayable - filters playable shorts ----------
-const pLimit = (await import('p-limit')).default;
-
+// ------------------ /filterPlayable ------------------
 app.post("/filterPlayable", express.json(), async (req, res) => {
-  const pLimit = (await import('p-limit')).default; // ✅ ES Module compatible
+  // ✅ Dynamic import only inside async function
+  const pLimit = (await import("p-limit")).default;
 
   const items = req.body.items;
   if (!Array.isArray(items)) {
@@ -189,8 +191,7 @@ app.post("/filterPlayable", express.json(), async (req, res) => {
   }
 
   console.log(`🔍 Checking playability for ${items.length} shorts`);
-
-  const limit = pLimit(3); // Run max 3 at a time
+  const limit = pLimit(3);
 
   const results = await Promise.allSettled(
     items.map(item =>
@@ -212,12 +213,7 @@ app.post("/filterPlayable", express.json(), async (req, res) => {
             f.acodec && f.acodec !== "none"
           );
 
-          const playable = hasVideo && hasAudio;
-          if (!playable) {
-            console.log(`🚫 Not playable: ${id}`);
-          }
-
-          return playable ? item : null;
+          return hasVideo && hasAudio ? item : null;
         } catch (err) {
           console.error(`❌ yt-dlp error for ${id}:`, err.message);
           return null;
@@ -233,17 +229,6 @@ app.post("/filterPlayable", express.json(), async (req, res) => {
   console.log(`✅ ${filtered.length} shorts are playable`);
   res.json({ playable: filtered });
 });
-
-
-const util = require("util");
-const execPromise = (cmd) => {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }, (err, stdout) => {
-      if (err) return reject(err);
-      resolve({ stdout });
-    });
-  });
-};
 
 // ------------------ Start Server ------------------
 app.listen(PORT, () => {
