@@ -145,6 +145,37 @@ app.get("/stream480", (req, res) => {
     res.redirect(format.url);
   });
 });
+// ------------------ /streamMp4 endpoint (Fast 480p+audio MP4 using yt-dlp -g) ------------------
+app.get("/streamMp4", (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: "Missing video ID" });
+
+  const cacheKey = `streamMp4_${id}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    console.log(`Cache hit for /streamMp4 ${id}`);
+    return res.redirect(cached);
+  }
+
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  const cmd = `yt-dlp -f "bestvideo[height<=480][ext=mp4][vcodec!=none][acodec!=none]" -g "${url}"`;
+
+  exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+    if (err || !stdout) {
+      console.error("yt-dlp error:", err || "no output");
+      return res.status(500).json({ error: "Failed to fetch playable stream" });
+    }
+
+    const finalUrl = stdout.trim().split('\n').pop();
+    if (!finalUrl) {
+      return res.status(404).json({ error: "Playable MP4 format not found" });
+    }
+
+    console.log(`✅ /streamMp4 redirecting to: ${finalUrl}`);
+    cache.set(cacheKey, finalUrl);
+    res.redirect(finalUrl);
+  });
+});
 
 
 // ------------------ Start Server ------------------
