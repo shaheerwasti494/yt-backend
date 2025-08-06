@@ -177,6 +177,46 @@ app.get("/streamMp4", (req, res) => {
   });
 });
 
+// ---------- /filterPlayable - filters playable shorts ----------
+app.post("/filterPlayable", express.json(), async (req, res) => {
+  const items = req.body.items;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: "Invalid input" });
+  }
+
+  const results = await Promise.allSettled(items.map(async item => {
+    const id = item?.id?.videoId;
+    if (!id) return null;
+
+    try {
+      const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
+      const { stdout } = await execPromise(cmd);
+
+      const info = JSON.parse(stdout);
+      const hasVideo = (info.formats || []).some(f =>
+        f.ext === "mp4" &&
+        f.vcodec && f.vcodec !== "none" &&
+        f.height && f.height <= 480
+      );
+      const hasAudio = (info.formats || []).some(f =>
+        f.acodec && f.acodec !== "none"
+      );
+
+      return hasVideo && hasAudio ? item : null;
+    } catch {
+      return null;
+    }
+  }));
+
+  const filtered = results
+    .filter(r => r.status === "fulfilled" && r.value !== null)
+    .map(r => r.value);
+
+  res.json({ playable: filtered });
+});
+
+const util = require("util");
+const execPromise = util.promisify(require("child_process").exec);
 
 // ------------------ Start Server ------------------
 app.listen(PORT, () => {
