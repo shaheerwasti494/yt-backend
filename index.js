@@ -247,5 +247,3 @@ const execPromise = (cmd) => {
 app.listen(PORT, () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
 });
-
-is this correct?
