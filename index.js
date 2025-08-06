@@ -178,47 +178,74 @@ app.get("/streamMp4", (req, res) => {
 });
 
 // ---------- /filterPlayable - filters playable shorts ----------
+const pLimit = require("p-limit"); // At the top of server.js if not already
+
 app.post("/filterPlayable", express.json(), async (req, res) => {
   const items = req.body.items;
   if (!Array.isArray(items)) {
     return res.status(400).json({ error: "Invalid input" });
   }
 
-  const results = await Promise.allSettled(items.map(async item => {
-    const id = item?.id?.videoId;
-    if (!id) return null;
+  console.log(`🔍 Checking playability for ${items.length} shorts`);
 
-    try {
-      const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
-      const { stdout } = await execPromise(cmd);
+  const limit = pLimit(3); // Run max 3 at a time
 
-      const info = JSON.parse(stdout);
-      const hasVideo = (info.formats || []).some(f =>
-        f.ext === "mp4" &&
-        f.vcodec && f.vcodec !== "none" &&
-        f.height && f.height <= 480
-      );
-      const hasAudio = (info.formats || []).some(f =>
-        f.acodec && f.acodec !== "none"
-      );
+  const results = await Promise.allSettled(
+    items.map(item =>
+      limit(async () => {
+        const id = item?.id?.videoId;
+        if (!id) return null;
 
-      return hasVideo && hasAudio ? item : null;
-    } catch {
-      return null;
-    }
-  }));
+        try {
+          const cmd = `yt-dlp -J "https://www.youtube.com/watch?v=${id}"`;
+          const { stdout } = await execPromise(cmd);
+
+          const info = JSON.parse(stdout);
+          const hasVideo = (info.formats || []).some(f =>
+            f.ext === "mp4" &&
+            f.vcodec && f.vcodec !== "none" &&
+            f.height && f.height <= 480
+          );
+          const hasAudio = (info.formats || []).some(f =>
+            f.acodec && f.acodec !== "none"
+          );
+
+          const playable = hasVideo && hasAudio;
+          if (!playable) {
+            console.log(`🚫 Not playable: ${id}`);
+          }
+
+          return playable ? item : null;
+        } catch (err) {
+          console.error(`❌ yt-dlp error for ${id}:`, err.message);
+          return null;
+        }
+      })
+    )
+  );
 
   const filtered = results
     .filter(r => r.status === "fulfilled" && r.value !== null)
     .map(r => r.value);
 
+  console.log(`✅ ${filtered.length} shorts are playable`);
   res.json({ playable: filtered });
 });
 
+
 const util = require("util");
-const execPromise = util.promisify(require("child_process").exec);
+const execPromise = (cmd) => {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve({ stdout });
+    });
+  });
+};
 
 // ------------------ Start Server ------------------
 app.listen(PORT, () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
 });
+
+is this correct?
