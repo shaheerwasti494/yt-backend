@@ -178,9 +178,11 @@ app.get("/streamMp4", (req, res) => {
 });
 
 // ---------- /filterPlayable - filters playable shorts ----------
-const pLimit = require("p-limit"); // At the top of server.js if not already
+const pLimit = (await import('p-limit')).default;
 
 app.post("/filterPlayable", express.json(), async (req, res) => {
+  const pLimit = (await import('p-limit')).default; // ✅ ES Module compatible
+
   const items = req.body.items;
   if (!Array.isArray(items)) {
     return res.status(400).json({ error: "Invalid input" });
