@@ -83,14 +83,15 @@ app.get("/stream", (req, res) => {
   });
 });
 
-// ------------------ /streamMp4 endpoint (Redirect) ------------------
-app.get("/streamMp4", (req, res) => {
+// ------------------ /stream480 endpoint (480p + audio+video only) ------------------
+app.get("/stream480", (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "Missing video ID" });
 
-  const cached = cache.get(`streamMp4_${id}`);
+  const cacheKey = `stream480_${id}`;
+  const cached = cache.get(cacheKey);
   if (cached) {
-    console.log(`Cache hit for /streamMp4 ${id}`);
+    console.log(`Cache hit for /stream480 ${id}`);
     return res.redirect(cached);
   }
 
@@ -111,27 +112,40 @@ app.get("/streamMp4", (req, res) => {
       return res.status(500).json({ error: "Invalid JSON from yt-dlp" });
     }
 
-    const mp4s = (info.formats || [])
-      .filter(f => f.ext === "mp4" && f.vcodec && f.vcodec !== "none")
-      .map(f => ({
-        url: f.url,
-        height: f.height || 0,
-        hasAudio: !!(f.acodec && f.acodec !== "none")
-      }));
+    const merged = (info.formats || [])
+      .filter(f =>
+        f.ext === "mp4" &&
+        f.vcodec && f.vcodec !== "none" &&
+        f.acodec && f.acodec !== "none" &&
+        f.height
+      );
 
-    if (!mp4s.length) {
-      return res.status(404).json({ error: "No MP4 formats found" });
+    if (!merged.length) {
+      return res.status(404).json({ error: "No merged (audio+video) MP4 found" });
     }
 
-    let chosen = mp4s
-      .filter(x => x.height <= 360)
-      .sort((a, b) => b.height - a.height)[0] || mp4s.sort((a, b) => b.height - a.height)[0];
+    // Try to find exactly 480p or closest below it
+    let format = merged
+      .filter(f => f.height <= 480)
+      .sort((a, b) => b.height - a.height)[0];
 
-    console.log(`Redirecting to ${chosen.height}p MP4 (hasAudio=${chosen.hasAudio})`);
-    cache.set(`streamMp4_${id}`, chosen.url); // Cache redirect URL
-    res.redirect(chosen.url);
+    // If not found, use the lowest available above 480p
+    if (!format) {
+      format = merged
+        .filter(f => f.height > 480)
+        .sort((a, b) => a.height - b.height)[0];
+    }
+
+    if (!format || !format.url) {
+      return res.status(404).json({ error: "No suitable format found" });
+    }
+
+    console.log(`✅ Redirecting to ${format.height}p merged MP4`);
+    cache.set(cacheKey, format.url); // cache the final URL
+    res.redirect(format.url);
   });
 });
+
 
 // ------------------ Start Server ------------------
 app.listen(PORT, () => {
