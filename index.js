@@ -15,7 +15,7 @@ const cache = new NodeCache({ stdTTL: 300 }); // 5 min cache
 // Helper: promisified exec
 const execPromise = (cmd) => {
   return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }, (err, stdout) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 45000 }, (err, stdout) => {
       if (err) return reject(err);
       resolve({ stdout });
     });
