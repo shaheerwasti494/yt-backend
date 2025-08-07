@@ -149,36 +149,28 @@ app.get("/stream480", (req, res) => {
 });
 
 // ------------------ /streamMp4 ------------------
-app.get("/streamMp4", (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.status(400).json({ error: "Missing video ID" });
+app.get("/streamMp4", async (req, res) => {
+  const { id, max = 720 } = req.query;
+  if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Bad id" });
 
-  const cacheKey = `streamMp4_${id}`;
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    console.log(`Cache hit for /streamMp4 ${id}`);
-    return res.redirect(cached);
+  const cacheKey = `mp4_${max}_${id}`;
+  if (cache.has(cacheKey)) return res.redirect(cache.get(cacheKey));
+
+  try {
+    const url = `https://www.youtube.com/watch?v=${id}`;
+    const { stdout } = await execPromise(
+      `yt-dlp -f "best[ext=mp4][height<=${max}][vcodec!=none][acodec!=none]/best[ext=mp4]" -g "${url}"`
+    );
+    const direct = stdout.trim().split("\n").pop();
+    if (!direct) throw new Error("No MP4");
+
+    cache.set(cacheKey, direct);
+    res.redirect(direct);          // 302 by default, good for ExoPlayer
+  } catch (e) {
+    res.status(502).json({ error: e.message });
   }
-
-  const url = `https://www.youtube.com/watch?v=${id}`;
-  const cmd = `yt-dlp -f "bestvideo[height<=480][ext=mp4][vcodec!=none][acodec!=none]" -g "${url}"`;
-
-  exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-    if (err || !stdout) {
-      console.error("yt-dlp error:", err || "no output");
-      return res.status(500).json({ error: "Failed to fetch playable stream" });
-    }
-
-    const finalUrl = stdout.trim().split('\n').pop();
-    if (!finalUrl) {
-      return res.status(404).json({ error: "Playable MP4 format not found" });
-    }
-
-    console.log(`✅ /streamMp4 redirecting to: ${finalUrl}`);
-    cache.set(cacheKey, finalUrl);
-    res.redirect(finalUrl);
-  });
 });
+
 
 // ------------------ /filterPlayable ------------------
 app.post("/filterPlayable", express.json(), async (req, res) => {
