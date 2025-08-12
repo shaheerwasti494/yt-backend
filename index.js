@@ -408,23 +408,25 @@ app.post("/filterPlayable", async (req, res) => {
       items.map(it => it?.id?.videoId).filter(id => typeof id === "string" && YT_ID.test(id))
     ));
 
-    const results = await Promise.all(ids.map(id =>
-      schedule(async () => {
-        try {
-          const { info } = await fetchInfoWithFallback(id);
-          const fmts = Array.isArray(info?.formats) ? info.formats : [];
+    const results = await Promise.all(
+      ids.map(id =>
+        schedule(async () => {
+          try {
+            const { info } = await fetchInfoWithFallback(id);
+            const fmts = Array.isArray(info?.formats) ? info.formats : [];
 
-          const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
-          if (hasHls) return id; // HLS masters are self-contained for Exo
+            const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
+            if (hasHls) return id; // HLS masters are self-contained for Exo
 
-          const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
-          const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
-          return (hasVideo && hasAudio) ? id : null;
-        } catch {
-          return null;
-        }
-      })
-    ));
+            const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
+            const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
+            return (hasVideo && hasAudio) ? id : null;
+          } catch {
+            return null;
+          }
+        })
+      )
+    );
 
     const playableSet = new Set(results.filter(Boolean));
     const playable = items.filter(it => playableSet.has(it?.id?.videoId));
@@ -436,6 +438,7 @@ app.post("/filterPlayable", async (req, res) => {
     res.status(500).json({ error: "Failed to filter" });
   }
 });
+
 
 app.listen(PORT, () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
