@@ -1,4 +1,3 @@
-// server.js (optimized)
 "use strict";
 
 const express = require("express");
@@ -6,35 +5,45 @@ const cors = require("cors");
 const compression = require("compression");
 const NodeCache = require("node-cache");
 const { spawn } = require("child_process");
+const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Middlewares
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: "256kb" })); // only used by /filterPlayable
+app.use(express.json({ limit: "256kb" }));
 
-// ---- Config
+// ---------- Config ----------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300); // seconds (5 min)
-const URL_TTL = Number(process.env.URL_TTL || 300);   // seconds for direct URLs
-const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4); // global child-process concurrency
+const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds
+const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4);
 const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
 
-// ---- Caches
-const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
-/** Deduplicate simultaneous requests for the same key */
-const inFlight = new Map();
+// Comma list of clients to try in order
+const YT_CLIENTS = (process.env.YT_CLIENTS || "android,web,tv,ios")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// ---- Simple semaphore for yt-dlp concurrency
+// Optional cookies file (for age/region)
+const YT_COOKIES = process.env.YT_COOKIES;
+const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
+
+// ---------- Caches ----------
+const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
+const inFlight = new Map(); // de-dupe concurrent fetches
+
+// ---------- Concurrency (semaphore) ----------
 let running = 0;
 const queue = [];
 function schedule(fn) {
   return new Promise((resolve, reject) => {
     queue.push(async () => {
       running++;
-      try { resolve(await fn()); } catch (e) { reject(e); }
+      try { resolve(await fn()); }
+      catch (e) { reject(e); }
       finally { running--; tick(); }
     });
     tick();
@@ -47,146 +56,231 @@ function tick() {
   }
 }
 
-// ---- Helpers
+// ---------- Helpers ----------
 const YT_ID = /^[\w-]{11}$/;
 
-function setCacheHeaders(res, seconds) {
-  res.set("Cache-Control", `public, max-age=${seconds}, s-maxage=${seconds}`);
+function setCacheHeaders(res, seconds, extra = "public") {
+  res.set("Cache-Control", `${extra}, max-age=${seconds}, s-maxage=${seconds}`);
+}
+function setShortPrivate(res, seconds = 60) {
+  res.set("Cache-Control", `private, max-age=${seconds}`);
 }
 
-function spawnYtDlpJSON(url) {
+/** Parse 'expire' from googlevideo-style URLs for adaptive TTL. */
+function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {}) {
+  try {
+    const u = new URL(urlStr);
+    const exp = Number(u.searchParams.get("expire") || u.searchParams.get("Expires"));
+    if (Number.isFinite(exp) && exp > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      const remain = exp - now - safety;
+      return Math.max(floor, Math.min(ceil, remain));
+    }
+  } catch (_) {}
+  return URL_TTL_FALLBACK;
+}
+
+// Shared small helpers
+const pickUrl = (f) =>
+  f?.url ||
+  f?.manifest_url ||
+  f?.hls_manifest_url ||
+  f?.dash_manifest_url ||
+  f?.fragment_base_url ||
+  null;
+
+const looksLikeHls = (url, proto, ext) =>
+  (typeof proto === "string" && proto.includes("m3u8")) ||
+  (typeof ext === "string" && ext.includes("m3u8")) ||
+  (typeof url === "string" && url.includes(".m3u8"));
+
+const isStoryboard = (f) =>
+  f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
+
+/** Spawn yt-dlp and return parsed JSON. */
+function spawnYtDlpJSON(url, playerClient = "android") {
   return schedule(() =>
     new Promise((resolve, reject) => {
       const args = [
         "-J",
         "--no-warnings",
         "--no-progress",
-        url
+        "--extractor-args", `youtube:player_client=${playerClient}`,
       ];
+      if (HAS_COOKIES) { args.push("--cookies", YT_COOKIES); }
+      args.push(url);
+
       const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let out = "";
-      let err = "";
-      const timer = setTimeout(() => {
-        try { child.kill("SIGKILL"); } catch {}
-      }, YTDLP_TIMEOUT_MS);
+      let out = "", err = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
       child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (c) => { out += c; });
-      child.stderr.on("data", (c) => { err += c; });
+      child.stdout.on("data", c => (out += c));
+      child.stderr.on("data", c => (err += c));
 
-      child.on("error", (e) => {
-        clearTimeout(timer);
-        reject(new Error(`yt-dlp spawn error: ${e.message}`));
-      });
-
-      child.on("close", (code) => {
+      child.on("error", e => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
+      child.on("close", code => {
         clearTimeout(timer);
         if (!out && code !== 0) {
-          return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-4).join(" ")}`));
+          return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
         }
-        try {
-          const json = JSON.parse(out);
-          resolve(json);
-        } catch (e) {
-          reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`));
-        }
+        try { resolve(JSON.parse(out)); }
+        catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
       });
     })
   );
 }
 
-/** Get yt-dlp JSON for a video id with memory cache + in-flight de-dup */
-async function getVideoInfo(id) {
-  const key = `info_${id}`;
-  const hit = cache.get(key);
-  if (hit) return hit;
+/** Last-resort: get a single direct URL string via -g -f ... */
+function spawnYtDlpBestUrl(url, playerClient = "android") {
+  return schedule(() =>
+    new Promise((resolve, reject) => {
+      const args = [
+        "-g",
+        "--no-warnings",
+        "--no-progress",
+        "--extractor-args", `youtube:player_client=${playerClient}`,
+        "-f", 'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
+      ];
+      if (HAS_COOKIES) { args.push("--cookies", YT_COOKIES); }
+      args.push(url);
 
-  if (inFlight.has(key)) return inFlight.get(key);
+      const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "", err = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
-  const p = (async () => {
-    const url = `https://www.youtube.com/watch?v=${id}`;
-    const info = await spawnYtDlpJSON(url);
-    cache.set(key, info, INFO_TTL);
-    return info;
-  })();
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", c => (out += c));
+      child.stderr.on("data", c => (err += c));
 
-  inFlight.set(key, p);
-  try {
-    return await p;
-  } finally {
-    inFlight.delete(key);
-  }
+      child.on("error", e => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
+      child.on("close", code => {
+        clearTimeout(timer);
+        if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
+        const url = out.trim().split("\n").pop();
+        if (!url) return reject(new Error("No direct URL from yt-dlp -g"));
+        resolve(url);
+      });
+    })
+  );
 }
 
-/** Build clean video/audio lists from yt-dlp info */
+/** Try multiple clients and return first JSON with usable formats. */
+async function fetchInfoWithFallback(id) {
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  let lastErr;
+  for (const client of YT_CLIENTS) {
+    try {
+      const info = await spawnYtDlpJSON(url, client);
+      const fmts = Array.isArray(info?.formats) ? info.formats : [];
+      const hasUsable = fmts.some(f =>
+        f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url
+      );
+      if (hasUsable) return { info, client };
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  // As a last resort, return minimal info with one best URL
+  const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
+  return {
+    info: {
+      id,
+      formats: [{
+        format_id: "best",
+        ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+        protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
+        vcodec: "unknown",
+        acodec: "unknown",
+        url: bestUrl,
+      }]
+    },
+    client: "best-url"
+  };
+}
+
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
 
   const videoFormats = formats
-    .filter((f) => f?.vcodec && f.vcodec !== "none")
-    .map((f) => ({
-      format_id: f.format_id,
-      extension: f.ext,
-      resolution: f.height ? `${f.height}p` : "unknown",
-      height: f.height || 0,
-      protocol: f.protocol || null,
-      has_audio: !!(f.acodec && f.acodec !== "none"),
-      bandwidth: f.tbr || f.abr || null,
-      url: f.url || null
-    }))
-    .filter((fmt) => fmt.url) // only keep direct URLs
+    .filter((f) => !isStoryboard(f))
+    .filter((f) =>
+      // keep adaptive video or anything that looks like a playable HLS/DASH entry
+      (f?.vcodec && f.vcodec !== "none") ||
+      f?.height ||
+      f?.manifest_url ||
+      f?.hls_manifest_url
+    )
+    .map((f) => {
+      const url = pickUrl(f);
+      const height = Number(f?.height) || 0;
+      const hls = looksLikeHls(url, f?.protocol, f?.ext);
+      return {
+        format_id: f?.format_id,
+        extension: f?.ext || (hls ? "m3u8" : "mp4"),
+        resolution: height ? `${height}p` : "unknown",
+        height,
+        protocol: f?.protocol || (hls ? "m3u8_native" : "https"),
+        // HLS masters are self-contained (ExoPlayer pulls audio via manifest)
+        has_audio: hls ? true : !!(f?.acodec && f.acodec !== "none"),
+        bandwidth: f?.tbr || f?.abr || null,
+        url,
+      };
+    })
+    .filter((fmt) => fmt.url)
     .filter((fmt, i, arr) =>
-      arr.findIndex((x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol) === i
+      arr.findIndex(
+        (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
+      ) === i
     )
     .sort((a, b) => a.height - b.height);
 
   const audioFormats = formats
-    .filter((f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
+    .filter((f) => !isStoryboard(f))
+    .filter((f) => (!f?.vcodec || f.vcodec === "none") && f?.acodec && f.acodec !== "none")
     .map((f) => ({
-      format_id: f.format_id,
-      extension: f.ext,
-      protocol: f.protocol || null,
-      bitrate: f.abr || f.tbr || null,
-      url: f.url || null
-    }))
+      format_id: f?.format_id,
+      extension: f?.ext || "m4a",
+      protocol: f?.protocol || "https",
+      bitrate: f?.abr || f?.tbr || null,
+      url: pickUrl(f),
+    ))
     .filter((fmt) => fmt.url)
     .filter((fmt, i, arr) =>
-      arr.findIndex((x) => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol) === i
+      arr.findIndex(
+        (x) => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol
+      ) === i
     )
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
   return { videoFormats, audioFormats };
 }
 
-/** Pick best merged MP4 with audio+video around a max height */
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
-  const merged = formats.filter(
-    (f) =>
-      f?.ext === "mp4" &&
-      f?.url &&
-      f?.vcodec && f.vcodec !== "none" &&
-      f?.acodec && f.acodec !== "none" &&
-      f?.height
-  );
 
+  const merged = formats.filter(f =>
+    f?.ext === "mp4" &&
+    pickUrl(f) &&
+    f?.vcodec && f.vcodec !== "none" &&
+    f?.acodec && f.acodec !== "none" &&
+    f?.height
+  );
   if (!merged.length) return null;
 
-  // Prefer <= max height (closest below), else smallest above
-  const below = merged.filter((f) => f.height <= maxHeight).sort((a, b) => b.height - a.height)[0];
+  const below = merged.filter(f => f.height <= maxHeight).sort((a, b) => b.height - a.height)[0];
   if (below) return below;
-
-  return merged.filter((f) => f.height > maxHeight).sort((a, b) => a.height - b.height)[0] || null;
+  return merged.filter(f => f.height > maxHeight).sort((a, b) => a.height - b.height)[0] || null;
 }
 
 // ---------- Routes ----------
 
-// Health
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true, running, queued: queue.length, cacheKeys: cache.keys().length });
 });
 
-// /stream  -> list available formats (video + audio) using cached JSON
+// Formats JSON (short private cache). Falls back to a single best URL if empty.
 app.get("/stream", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -195,15 +289,35 @@ app.get("/stream", async (req, res) => {
     const cacheKey = `stream_${id}`;
     const hit = cache.get(cacheKey);
     if (hit) {
-      setCacheHeaders(res, INFO_TTL);
+      res.set("X-PT-Cache", "HIT");
+      setShortPrivate(res, 60);
       return res.json(hit);
     }
 
-    const info = await getVideoInfo(id);
-    const result = buildFormats(info);
+    const { info, client } = await fetchInfoWithFallback(id);
+    let result = buildFormats(info);
 
-    cache.set(cacheKey, result, INFO_TTL);
-    setCacheHeaders(res, INFO_TTL);
+    // Belt-and-suspenders fallback if empty
+    if (!result.videoFormats.length) {
+      const bestUrl = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+      result = {
+        videoFormats: [{
+          format_id: "best",
+          extension: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+          resolution: "unknown",
+          height: 0,
+          protocol: bestUrl.includes(".m3u8") ? "m3u8_native" : "https",
+          has_audio: true,
+          bandwidth: null,
+          url: bestUrl
+        }],
+        audioFormats: []
+      };
+    }
+
+    cache.set(cacheKey, result, 60);
+    res.set("X-PT-Cache", `MISS;client=${client}`);
+    setShortPrivate(res, 60);
     res.json(result);
   } catch (e) {
     console.error("/stream error:", e.message);
@@ -211,7 +325,7 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// /stream480 -> redirect to a merged MP4 close to 480p (uses cached JSON)
+// Redirect to a merged MP4 close to 480p (uses URL expiry for TTL)
 app.get("/stream480", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -220,82 +334,93 @@ app.get("/stream480", async (req, res) => {
     const cacheKey = `stream480_${id}`;
     const cached = cache.get(cacheKey);
     if (cached) {
-      setCacheHeaders(res, URL_TTL);
+      res.set("X-PT-Cache", "HIT");
+      setCacheHeaders(res, computeUrlTtlSec(cached));
       return res.redirect(cached);
     }
 
-    const info = await getVideoInfo(id);
+    const { info } = await fetchInfoWithFallback(id);
     const fmt = pickBestMergedMp4(info, 480);
-    if (!fmt?.url) return res.status(404).json({ error: "No suitable merged MP4 found" });
+    if (fmt?.url) {
+      const ttl = computeUrlTtlSec(fmt.url);
+      cache.set(cacheKey, fmt.url, ttl);
+      res.set("X-PT-Cache", "MISS");
+      setCacheHeaders(res, ttl);
+      return res.redirect(fmt.url);
+    }
 
-    cache.set(cacheKey, fmt.url, URL_TTL);
-    setCacheHeaders(res, URL_TTL);
-    res.redirect(fmt.url);
+    // Fallback to a single best playable URL (may be HLS)
+    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+    const ttl = computeUrlTtlSec(url);
+    cache.set(cacheKey, url, ttl);
+    setCacheHeaders(res, ttl);
+    res.redirect(url);
   } catch (e) {
     console.error("/stream480 error:", e.message);
     res.status(500).json({ error: "Failed to pick 480p stream" });
   }
 });
 
-// /streamMp4 -> redirect to best merged MP4 under ?max= (uses cached JSON)
+// Redirect to best merged MP4 under ?max= (uses URL expiry for TTL)
 app.get("/streamMp4", async (req, res) => {
   try {
     const id = String(req.query.id || "");
     if (!YT_ID.test(id)) return res.status(400).json({ error: "Bad id" });
 
     const max = Math.max(144, Math.min(2160, parseInt(req.query.max || "720", 10) || 720));
-
     const cacheKey = `mp4_${max}_${id}`;
     const cached = cache.get(cacheKey);
     if (cached) {
-      setCacheHeaders(res, URL_TTL);
+      res.set("X-PT-Cache", "HIT");
+      setCacheHeaders(res, computeUrlTtlSec(cached));
       return res.redirect(cached);
     }
 
-    const info = await getVideoInfo(id);
+    const { info } = await fetchInfoWithFallback(id);
     const fmt = pickBestMergedMp4(info, max);
-    if (!fmt?.url) return res.status(404).json({ error: "No MP4 with audio found" });
+    if (fmt?.url) {
+      const ttl = computeUrlTtlSec(fmt.url);
+      cache.set(cacheKey, fmt.url, ttl);
+      res.set("X-PT-Cache", "MISS");
+      setCacheHeaders(res, ttl);
+      return res.redirect(fmt.url);
+    }
 
-    cache.set(cacheKey, fmt.url, URL_TTL);
-    setCacheHeaders(res, URL_TTL);
-    res.redirect(fmt.url);
+    // Final fallback: any best URL
+    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+    const ttl = computeUrlTtlSec(url);
+    cache.set(cacheKey, url, ttl);
+    setCacheHeaders(res, ttl);
+    res.redirect(url);
   } catch (e) {
     console.error("/streamMp4 error:", e.message);
     res.status(502).json({ error: e.message || "Failed to resolve MP4" });
   }
 });
 
-// /filterPlayable -> filter shorts that are playable (reuses cached JSON + small parallelism)
+// Filter playable shorts (HLS-aware)
 app.post("/filterPlayable", async (req, res) => {
   try {
     const items = req.body?.items;
     if (!Array.isArray(items)) return res.status(400).json({ error: "Invalid input" });
 
-    // unique, valid ids
-    const ids = Array.from(
-      new Set(
-        items
-          .map((it) => it?.id?.videoId)
-          .filter((id) => typeof id === "string" && YT_ID.test(id))
-      )
-    );
+    const ids = Array.from(new Set(
+      items.map(it => it?.id?.videoId).filter(id => typeof id === "string" && YT_ID.test(id))
+    ));
 
-    console.log(`🔍 Checking playability for ${ids.length} items`);
-
-    // Small parallelism with our semaphore
     const results = await Promise.all(
-      ids.map((id) =>
+      ids.map(id =>
         schedule(async () => {
           try {
-            const info = await getVideoInfo(id);
+            const { info } = await fetchInfoWithFallback(id);
             const fmts = Array.isArray(info?.formats) ? info.formats : [];
 
-            const hasVideo = fmts.some(
-              (f) => f?.ext === "mp4" && f?.vcodec && f.vcodec !== "none" && f?.height && f.height <= 480 && f?.url
-            );
-            const hasAudio = fmts.some((f) => f?.acodec && f.acodec !== "none" && f?.url);
+            const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
+            if (hasHls) return id; // HLS masters are self-contained for Exo
 
-            return hasVideo && hasAudio ? id : null;
+            const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
+            const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
+            return (hasVideo && hasAudio) ? id : null;
           } catch {
             return null;
           }
@@ -304,10 +429,9 @@ app.post("/filterPlayable", async (req, res) => {
     );
 
     const playableSet = new Set(results.filter(Boolean));
-    const playable = items.filter((it) => playableSet.has(it?.id?.videoId));
+    const playable = items.filter(it => playableSet.has(it?.id?.videoId));
 
-    console.log(`✅ ${playable.length} playable out of ${items.length}`);
-    setCacheHeaders(res, INFO_TTL);
+    setShortPrivate(res, 60);
     res.json({ playable });
   } catch (e) {
     console.error("/filterPlayable error:", e.message);
@@ -315,7 +439,7 @@ app.post("/filterPlayable", async (req, res) => {
   }
 });
 
-// ---- Start
+
 app.listen(PORT, () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
 });
