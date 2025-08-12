@@ -5,26 +5,35 @@ const cors = require("cors");
 const compression = require("compression");
 const NodeCache = require("node-cache");
 const { spawn } = require("child_process");
+const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: "256kb" })); // for /filterPlayable
+app.use(express.json({ limit: "256kb" }));
 
 // ---------- Config ----------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300);   // seconds
-const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300);
+const INFO_TTL = Number(process.env.INFO_TTL || 300);            // seconds
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300);     // seconds
 const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4);
 const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
+// Comma list of clients to try in order
+const YT_CLIENTS = (process.env.YT_CLIENTS || "android,web,tv,ios")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+// Optional cookies file (for age/region)
+const YT_COOKIES = process.env.YT_COOKIES;
+const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
 
 // ---------- Caches ----------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
-const inFlight = new Map(); // de-dupe concurrent fetches
+const inFlight = new Map();
 
-// ---------- Simple semaphore ----------
+// ---------- Concurrency ----------
 let running = 0;
 const queue = [];
 function schedule(fn) {
@@ -50,12 +59,11 @@ const YT_ID = /^[\w-]{11}$/;
 function setCacheHeaders(res, seconds, extra = "public") {
   res.set("Cache-Control", `${extra}, max-age=${seconds}, s-maxage=${seconds}`);
 }
-
 function setShortPrivate(res, seconds = 60) {
   res.set("Cache-Control", `private, max-age=${seconds}`);
 }
 
-/** Parse 'expire' (epoch seconds) from googlevideo URL → remaining TTL in seconds. */
+/** Parse 'expire' from googlevideo-style URLs for adaptive TTL. */
 function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {}) {
   try {
     const u = new URL(urlStr);
@@ -69,29 +77,33 @@ function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {})
   return URL_TTL_FALLBACK;
 }
 
-function spawnYtDlpJSON(url) {
+/** Spawn yt-dlp and return parsed JSON. */
+function spawnYtDlpJSON(url, playerClient = "android") {
   return schedule(() =>
     new Promise((resolve, reject) => {
       const args = [
         "-J",
         "--no-warnings",
         "--no-progress",
-        // Use Android player client for URLs that work well with Exo
-        "--extractor-args", "youtube:player_client=android",
-        url
+        "--extractor-args", `youtube:player_client=${playerClient}`,
       ];
+      if (HAS_COOKIES) { args.push("--cookies", YT_COOKIES); }
+      args.push(url);
+
       const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
       let out = "", err = "";
       const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
       child.stdout.setEncoding("utf8");
-      child.stdout.on("data", c => out += c);
-      child.stderr.on("data", c => err += c);
+      child.stdout.on("data", c => (out += c));
+      child.stderr.on("data", c => (err += c));
 
       child.on("error", e => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
       child.on("close", code => {
         clearTimeout(timer);
-        if (!out && code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-4).join(" ")}`));
+        if (!out && code !== 0) {
+          return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
+        }
         try { resolve(JSON.parse(out)); }
         catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
       });
@@ -99,40 +111,103 @@ function spawnYtDlpJSON(url) {
   );
 }
 
-/** Get yt-dlp info with cache + in-flight de-dup */
-async function getVideoInfo(id) {
-  const key = `info_${id}`;
-  const hit = cache.get(key);
-  if (hit) return hit;
-  if (inFlight.has(key)) return inFlight.get(key);
+/** Last-resort: get a single direct URL string via -g -f ... */
+function spawnYtDlpBestUrl(url, playerClient = "android") {
+  return schedule(() =>
+    new Promise((resolve, reject) => {
+      const args = [
+        "-g",
+        "--no-warnings",
+        "--no-progress",
+        "--extractor-args", `youtube:player_client=${playerClient}`,
+        "-f", 'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
+      ];
+      if (HAS_COOKIES) { args.push("--cookies", YT_COOKIES); }
+      args.push(url);
 
-  const p = (async () => {
-    const url = `https://www.youtube.com/watch?v=${id}`;
-    const info = await spawnYtDlpJSON(url);
-    cache.set(key, info, INFO_TTL);
-    return info;
-  })();
+      const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "", err = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
-  inFlight.set(key, p);
-  try { return await p; } finally { inFlight.delete(key); }
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", c => (out += c));
+      child.stderr.on("data", c => (err += c));
+
+      child.on("error", e => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
+      child.on("close", code => {
+        clearTimeout(timer);
+        if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
+        const url = out.trim().split("\n").pop();
+        if (!url) return reject(new Error("No direct URL from yt-dlp -g"));
+        resolve(url);
+      });
+    })
+  );
 }
 
-/** Format lists from yt-dlp JSON */
+/** Try multiple clients and return first JSON with usable formats. */
+async function fetchInfoWithFallback(id) {
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  let lastErr;
+  for (const client of YT_CLIENTS) {
+    try {
+      const info = await spawnYtDlpJSON(url, client);
+      const fmts = Array.isArray(info?.formats) ? info.formats : [];
+      // Consider usable if we have any URL-ish fields
+      const hasUsable = fmts.some(f =>
+        f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url
+      );
+      if (hasUsable) return { info, client };
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  // As a last resort, return minimal info with one best URL
+  try {
+    const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
+    return {
+      info: {
+        id,
+        formats: [{
+          format_id: "best",
+          ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+          protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
+          vcodec: "unknown",
+          acodec: "unknown",
+          url: bestUrl,
+        }]
+      },
+      client: "best-url"
+    };
+  } catch (e) {
+    throw lastErr || e;
+  }
+}
+
+/** Build clean lists (also accept manifest_* fallbacks) */
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
 
+  const pickUrl = (f) =>
+    f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
+
   const videoFormats = formats
-    .filter(f => f?.vcodec && f.vcodec !== "none")
-    .map(f => ({
-      format_id: f.format_id,
-      extension: f.ext,
-      resolution: f.height ? `${f.height}p` : "unknown",
-      height: f.height || 0,
-      protocol: f.protocol || null,
-      has_audio: !!(f.acodec && f.acodec !== "none"),
-      bandwidth: f.tbr || f.abr || null,
-      url: f.url || null
-    }))
+    .filter(f => (f?.vcodec && f.vcodec !== "none") || f?.height || f?.manifest_url || f?.hls_manifest_url)
+    .map(f => {
+      const url = pickUrl(f);
+      const height = Number(f?.height) || 0;
+      return {
+        format_id: f?.format_id,
+        extension: f?.ext || (url?.includes(".m3u8") ? "m3u8" : "mp4"),
+        resolution: height ? `${height}p` : "unknown",
+        height,
+        protocol: f?.protocol || (url?.includes(".m3u8") ? "m3u8" : "https"),
+        has_audio: !!(f?.acodec && f.acodec !== "none"), // heuristic
+        bandwidth: f?.tbr || f?.abr || null,
+        url
+      };
+    })
     .filter(fmt => fmt.url)
     .filter((fmt, i, arr) =>
       arr.findIndex(x => x.resolution === fmt.resolution && x.protocol === fmt.protocol) === i
@@ -140,13 +215,13 @@ function buildFormats(info) {
     .sort((a, b) => a.height - b.height);
 
   const audioFormats = formats
-    .filter(f => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
+    .filter(f => (!f?.vcodec || f.vcodec === "none") && f?.acodec && f.acodec !== "none")
     .map(f => ({
-      format_id: f.format_id,
-      extension: f.ext,
-      protocol: f.protocol || null,
-      bitrate: f.abr || f.tbr || null,
-      url: f.url || null
+      format_id: f?.format_id,
+      extension: f?.ext || "m4a",
+      protocol: f?.protocol || "https",
+      bitrate: f?.abr || f?.tbr || null,
+      url: pickUrl(f)
     }))
     .filter(fmt => fmt.url)
     .filter((fmt, i, arr) =>
@@ -159,9 +234,12 @@ function buildFormats(info) {
 
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const pickUrl = (f) =>
+    f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
+
   const merged = formats.filter(f =>
     f?.ext === "mp4" &&
-    f?.url &&
+    pickUrl(f) &&
     f?.vcodec && f.vcodec !== "none" &&
     f?.acodec && f.acodec !== "none" &&
     f?.height
@@ -179,7 +257,6 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true, running, queued: queue.length, cacheKeys: cache.keys().length });
 });
 
-// Return JSON with formats (short-cache so URLs stay fresh)
 app.get("/stream", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -193,11 +270,11 @@ app.get("/stream", async (req, res) => {
       return res.json(hit);
     }
 
-    const info = await getVideoInfo(id);
+    const { info, client } = await fetchInfoWithFallback(id);
     const result = buildFormats(info);
 
-    cache.set(cacheKey, result, 60); // keep internal copy for a minute
-    res.set("X-PT-Cache", "MISS");
+    cache.set(cacheKey, result, 60);
+    res.set("X-PT-Cache", `MISS;client=${client}`);
     setShortPrivate(res, 60);
     res.json(result);
   } catch (e) {
@@ -206,7 +283,6 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// Redirect to a merged MP4 close to 480p (use URL's own expiry for TTL)
 app.get("/stream480", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -220,22 +296,28 @@ app.get("/stream480", async (req, res) => {
       return res.redirect(cached);
     }
 
-    const info = await getVideoInfo(id);
+    const { info } = await fetchInfoWithFallback(id);
     const fmt = pickBestMergedMp4(info, 480);
-    if (!fmt?.url) return res.status(404).json({ error: "No suitable merged MP4 found" });
+    if (fmt?.url) {
+      const ttl = computeUrlTtlSec(fmt.url);
+      cache.set(cacheKey, fmt.url, ttl);
+      res.set("X-PT-Cache", "MISS");
+      setCacheHeaders(res, ttl);
+      return res.redirect(fmt.url);
+    }
 
-    const ttl = computeUrlTtlSec(fmt.url);
-    cache.set(cacheKey, fmt.url, ttl);
-    res.set("X-PT-Cache", "MISS");
+    // If no merged MP4, fallback to best URL
+    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+    const ttl = computeUrlTtlSec(url);
+    cache.set(cacheKey, url, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(fmt.url);
+    res.redirect(url);
   } catch (e) {
     console.error("/stream480 error:", e.message);
     res.status(500).json({ error: "Failed to pick 480p stream" });
   }
 });
 
-// Redirect to best merged MP4 under ?max=
 app.get("/streamMp4", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -250,22 +332,28 @@ app.get("/streamMp4", async (req, res) => {
       return res.redirect(cached);
     }
 
-    const info = await getVideoInfo(id);
+    const { info } = await fetchInfoWithFallback(id);
     const fmt = pickBestMergedMp4(info, max);
-    if (!fmt?.url) return res.status(404).json({ error: "No MP4 with audio found" });
+    if (fmt?.url) {
+      const ttl = computeUrlTtlSec(fmt.url);
+      cache.set(cacheKey, fmt.url, ttl);
+      res.set("X-PT-Cache", "MISS");
+      setCacheHeaders(res, ttl);
+      return res.redirect(fmt.url);
+    }
 
-    const ttl = computeUrlTtlSec(fmt.url);
-    cache.set(cacheKey, fmt.url, ttl);
-    res.set("X-PT-Cache", "MISS");
+    // Fallback
+    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+    const ttl = computeUrlTtlSec(url);
+    cache.set(cacheKey, url, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(fmt.url);
+    res.redirect(url);
   } catch (e) {
     console.error("/streamMp4 error:", e.message);
     res.status(502).json({ error: e.message || "Failed to resolve MP4" });
   }
 });
 
-// Filter playable shorts (reuses info cache; throttled by semaphore)
 app.post("/filterPlayable", async (req, res) => {
   try {
     const items = req.body?.items;
@@ -279,10 +367,10 @@ app.post("/filterPlayable", async (req, res) => {
     const results = await Promise.all(ids.map(id =>
       schedule(async () => {
         try {
-          const info = await getVideoInfo(id);
+          const { info } = await fetchInfoWithFallback(id);
           const fmts = Array.isArray(info?.formats) ? info.formats : [];
-          const hasVideo = fmts.some(f => f?.ext === "mp4" && f?.vcodec && f.vcodec !== "none" && f?.height && f.height <= 480 && f?.url);
-          const hasAudio = fmts.some(f => f?.acodec && f.acodec !== "none" && f?.url);
+          const hasVideo = fmts.some(f => (f?.ext === "mp4" || f?.manifest_url || f?.hls_manifest_url) && f?.vcodec && f.vcodec !== "none");
+          const hasAudio = fmts.some(f => f?.acodec && f.acodec !== "none");
           return hasVideo && hasAudio ? id : null;
         } catch { return null; }
       })
