@@ -188,21 +188,18 @@ async function fetchInfoWithFallback(id) {
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
 
-  const pickUrl = (f) =>
-    f?.url ||
-    f?.manifest_url ||
-    f?.hls_manifest_url ||
-    f?.dash_manifest_url ||
-    f?.fragment_base_url ||
-    null;
+const pickUrl = (f) =>
+  f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
+
 
   const isStoryboard = (f) =>
     f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
 
-  const looksLikeHls = (url, proto, ext) =>
-    (typeof proto === "string" && proto.includes("m3u8")) ||
-    (typeof ext === "string" && ext.includes("m3u8")) ||
-    (typeof url === "string" && url.includes(".m3u8"));
+const looksLikeHls = (url, proto, ext) =>
+  (typeof proto === "string" && proto.includes("m3u8")) ||
+  (typeof ext === "string" && ext.includes("m3u8")) ||
+  (typeof url === "string" && url.includes(".m3u8"));
+
 
   const videoFormats = formats
     .filter((f) => !isStoryboard(f))
@@ -259,6 +256,7 @@ function buildFormats(info) {
 
   return { videoFormats, audioFormats };
 }
+
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
   const pickUrl = (f) =>
@@ -391,17 +389,23 @@ app.post("/filterPlayable", async (req, res) => {
       .filter(id => typeof id === "string" && YT_ID.test(id))
     ));
 
-    const results = await Promise.all(ids.map(id =>
-      schedule(async () => {
-        try {
-          const { info } = await fetchInfoWithFallback(id);
-          const fmts = Array.isArray(info?.formats) ? info.formats : [];
-          const hasVideo = fmts.some(f => (f?.ext === "mp4" || f?.manifest_url || f?.hls_manifest_url) && f?.vcodec && f.vcodec !== "none");
-          const hasAudio = fmts.some(f => f?.acodec && f.acodec !== "none");
-          return hasVideo && hasAudio ? id : null;
-        } catch { return null; }
-      })
-    ));
+ const results = await Promise.all(ids.map(id =>
+  schedule(async () => {
+    try {
+      const { info } = await fetchInfoWithFallback(id);
+      const fmts = Array.isArray(info?.formats) ? info.formats : [];
+
+      const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
+      if (hasHls) return id; // HLS masters are self-contained for Exo
+
+      const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
+      const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
+      return (hasVideo && hasAudio) ? id : null;
+    } catch {
+      return null;
+    }
+  })
+));
 
     const playableSet = new Set(results.filter(Boolean));
     const playable = items.filter(it => playableSet.has(it?.id?.videoId));
