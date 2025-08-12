@@ -185,53 +185,80 @@ async function fetchInfoWithFallback(id) {
   }
 }
 
-/** Build clean lists (also accept manifest_* fallbacks) */
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
 
   const pickUrl = (f) =>
-    f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
+    f?.url ||
+    f?.manifest_url ||
+    f?.hls_manifest_url ||
+    f?.dash_manifest_url ||
+    f?.fragment_base_url ||
+    null;
+
+  const isStoryboard = (f) =>
+    f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
+
+  const looksLikeHls = (url, proto, ext) =>
+    (typeof proto === "string" && proto.includes("m3u8")) ||
+    (typeof ext === "string" && ext.includes("m3u8")) ||
+    (typeof url === "string" && url.includes(".m3u8"));
 
   const videoFormats = formats
-    .filter(f => (f?.vcodec && f.vcodec !== "none") || f?.height || f?.manifest_url || f?.hls_manifest_url)
-    .map(f => {
+    .filter((f) => !isStoryboard(f))
+    .filter((f) =>
+      // keep adaptive video or anything that looks like a playable HLS/DASH entry
+      (f?.vcodec && f.vcodec !== "none") ||
+      f?.height ||
+      f?.manifest_url ||
+      f?.hls_manifest_url
+    )
+    .map((f) => {
       const url = pickUrl(f);
       const height = Number(f?.height) || 0;
+      const hls = looksLikeHls(url, f?.protocol, f?.ext);
       return {
         format_id: f?.format_id,
-        extension: f?.ext || (url?.includes(".m3u8") ? "m3u8" : "mp4"),
+        extension: f?.ext || (hls ? "m3u8" : "mp4"),
         resolution: height ? `${height}p` : "unknown",
         height,
-        protocol: f?.protocol || (url?.includes(".m3u8") ? "m3u8" : "https"),
-        has_audio: !!(f?.acodec && f.acodec !== "none"), // heuristic
+        protocol: f?.protocol || (hls ? "m3u8_native" : "https"),
+        // HLS master/variant should be considered self-contained for ExoPlayer
+        has_audio: hls ? true : !!(f?.acodec && f.acodec !== "none"),
         bandwidth: f?.tbr || f?.abr || null,
-        url
+        url,
       };
     })
-    .filter(fmt => fmt.url)
-    .filter((fmt, i, arr) =>
-      arr.findIndex(x => x.resolution === fmt.resolution && x.protocol === fmt.protocol) === i
+    .filter((fmt) => fmt.url)
+    .filter(
+      (fmt, i, arr) =>
+        arr.findIndex(
+          (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
+        ) === i
     )
     .sort((a, b) => a.height - b.height);
 
   const audioFormats = formats
-    .filter(f => (!f?.vcodec || f.vcodec === "none") && f?.acodec && f.acodec !== "none")
-    .map(f => ({
+    .filter((f) => !isStoryboard(f))
+    .filter((f) => (!f?.vcodec || f.vcodec === "none") && f?.acodec && f.acodec !== "none")
+    .map((f) => ({
       format_id: f?.format_id,
       extension: f?.ext || "m4a",
       protocol: f?.protocol || "https",
       bitrate: f?.abr || f?.tbr || null,
-      url: pickUrl(f)
-    }))
-    .filter(fmt => fmt.url)
-    .filter((fmt, i, arr) =>
-      arr.findIndex(x => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol) === i
+      url: pickUrl(f),
+    ))
+    .filter((fmt) => fmt.url)
+    .filter(
+      (fmt, i, arr) =>
+        arr.findIndex(
+          (x) => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol
+        ) === i
     )
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
   return { videoFormats, audioFormats };
 }
-
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
   const pickUrl = (f) =>
