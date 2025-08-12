@@ -16,31 +16,34 @@ app.use(express.json({ limit: "256kb" }));
 
 // ---------- Config ----------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300);            // seconds
-const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300);     // seconds
+const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds
 const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4);
 const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
+
 // Comma list of clients to try in order
 const YT_CLIENTS = (process.env.YT_CLIENTS || "android,web,tv,ios")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+
 // Optional cookies file (for age/region)
 const YT_COOKIES = process.env.YT_COOKIES;
 const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
 
 // ---------- Caches ----------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
-const inFlight = new Map();
+const inFlight = new Map(); // de-dupe concurrent fetches
 
-// ---------- Concurrency ----------
+// ---------- Concurrency (semaphore) ----------
 let running = 0;
 const queue = [];
 function schedule(fn) {
   return new Promise((resolve, reject) => {
     queue.push(async () => {
       running++;
-      try { resolve(await fn()); } catch (e) { reject(e); }
+      try { resolve(await fn()); }
+      catch (e) { reject(e); }
       finally { running--; tick(); }
     });
     tick();
@@ -76,6 +79,23 @@ function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {})
   } catch (_) {}
   return URL_TTL_FALLBACK;
 }
+
+// Shared small helpers
+const pickUrl = (f) =>
+  f?.url ||
+  f?.manifest_url ||
+  f?.hls_manifest_url ||
+  f?.dash_manifest_url ||
+  f?.fragment_base_url ||
+  null;
+
+const looksLikeHls = (url, proto, ext) =>
+  (typeof proto === "string" && proto.includes("m3u8")) ||
+  (typeof ext === "string" && ext.includes("m3u8")) ||
+  (typeof url === "string" && url.includes(".m3u8"));
+
+const isStoryboard = (f) =>
+  f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
 
 /** Spawn yt-dlp and return parsed JSON. */
 function spawnYtDlpJSON(url, playerClient = "android") {
@@ -153,7 +173,6 @@ async function fetchInfoWithFallback(id) {
     try {
       const info = await spawnYtDlpJSON(url, client);
       const fmts = Array.isArray(info?.formats) ? info.formats : [];
-      // Consider usable if we have any URL-ish fields
       const hasUsable = fmts.some(f =>
         f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url
       );
@@ -164,42 +183,25 @@ async function fetchInfoWithFallback(id) {
     }
   }
   // As a last resort, return minimal info with one best URL
-  try {
-    const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
-    return {
-      info: {
-        id,
-        formats: [{
-          format_id: "best",
-          ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
-          protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
-          vcodec: "unknown",
-          acodec: "unknown",
-          url: bestUrl,
-        }]
-      },
-      client: "best-url"
-    };
-  } catch (e) {
-    throw lastErr || e;
-  }
+  const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
+  return {
+    info: {
+      id,
+      formats: [{
+        format_id: "best",
+        ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+        protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
+        vcodec: "unknown",
+        acodec: "unknown",
+        url: bestUrl,
+      }]
+    },
+    client: "best-url"
+  };
 }
 
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
-
-const pickUrl = (f) =>
-  f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
-
-
-  const isStoryboard = (f) =>
-    f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
-
-const looksLikeHls = (url, proto, ext) =>
-  (typeof proto === "string" && proto.includes("m3u8")) ||
-  (typeof ext === "string" && ext.includes("m3u8")) ||
-  (typeof url === "string" && url.includes(".m3u8"));
-
 
   const videoFormats = formats
     .filter((f) => !isStoryboard(f))
@@ -220,18 +222,17 @@ const looksLikeHls = (url, proto, ext) =>
         resolution: height ? `${height}p` : "unknown",
         height,
         protocol: f?.protocol || (hls ? "m3u8_native" : "https"),
-        // HLS master/variant should be considered self-contained for ExoPlayer
+        // HLS masters are self-contained (ExoPlayer pulls audio via manifest)
         has_audio: hls ? true : !!(f?.acodec && f.acodec !== "none"),
         bandwidth: f?.tbr || f?.abr || null,
         url,
       };
     })
     .filter((fmt) => fmt.url)
-    .filter(
-      (fmt, i, arr) =>
-        arr.findIndex(
-          (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
-        ) === i
+    .filter((fmt, i, arr) =>
+      arr.findIndex(
+        (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
+      ) === i
     )
     .sort((a, b) => a.height - b.height);
 
@@ -246,11 +247,10 @@ const looksLikeHls = (url, proto, ext) =>
       url: pickUrl(f),
     ))
     .filter((fmt) => fmt.url)
-    .filter(
-      (fmt, i, arr) =>
-        arr.findIndex(
-          (x) => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol
-        ) === i
+    .filter((fmt, i, arr) =>
+      arr.findIndex(
+        (x) => x.bitrate === fmt.bitrate && x.protocol === fmt.protocol
+      ) === i
     )
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
@@ -259,8 +259,6 @@ const looksLikeHls = (url, proto, ext) =>
 
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
-  const pickUrl = (f) =>
-    f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
 
   const merged = formats.filter(f =>
     f?.ext === "mp4" &&
@@ -282,6 +280,7 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true, running, queued: queue.length, cacheKeys: cache.keys().length });
 });
 
+// Formats JSON (short private cache). Falls back to a single best URL if empty.
 app.get("/stream", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -296,7 +295,25 @@ app.get("/stream", async (req, res) => {
     }
 
     const { info, client } = await fetchInfoWithFallback(id);
-    const result = buildFormats(info);
+    let result = buildFormats(info);
+
+    // Belt-and-suspenders fallback if empty
+    if (!result.videoFormats.length) {
+      const bestUrl = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
+      result = {
+        videoFormats: [{
+          format_id: "best",
+          extension: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+          resolution: "unknown",
+          height: 0,
+          protocol: bestUrl.includes(".m3u8") ? "m3u8_native" : "https",
+          has_audio: true,
+          bandwidth: null,
+          url: bestUrl
+        }],
+        audioFormats: []
+      };
+    }
 
     cache.set(cacheKey, result, 60);
     res.set("X-PT-Cache", `MISS;client=${client}`);
@@ -308,6 +325,7 @@ app.get("/stream", async (req, res) => {
   }
 });
 
+// Redirect to a merged MP4 close to 480p (uses URL expiry for TTL)
 app.get("/stream480", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -331,7 +349,7 @@ app.get("/stream480", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    // If no merged MP4, fallback to best URL
+    // Fallback to a single best playable URL (may be HLS)
     const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
     const ttl = computeUrlTtlSec(url);
     cache.set(cacheKey, url, ttl);
@@ -343,6 +361,7 @@ app.get("/stream480", async (req, res) => {
   }
 });
 
+// Redirect to best merged MP4 under ?max= (uses URL expiry for TTL)
 app.get("/streamMp4", async (req, res) => {
   try {
     const id = String(req.query.id || "");
@@ -367,7 +386,7 @@ app.get("/streamMp4", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    // Fallback
+    // Final fallback: any best URL
     const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
     const ttl = computeUrlTtlSec(url);
     cache.set(cacheKey, url, ttl);
@@ -379,33 +398,33 @@ app.get("/streamMp4", async (req, res) => {
   }
 });
 
+// Filter playable shorts (HLS-aware)
 app.post("/filterPlayable", async (req, res) => {
   try {
     const items = req.body?.items;
     if (!Array.isArray(items)) return res.status(400).json({ error: "Invalid input" });
 
-    const ids = Array.from(new Set(items
-      .map(it => it?.id?.videoId)
-      .filter(id => typeof id === "string" && YT_ID.test(id))
+    const ids = Array.from(new Set(
+      items.map(it => it?.id?.videoId).filter(id => typeof id === "string" && YT_ID.test(id))
     ));
 
- const results = await Promise.all(ids.map(id =>
-  schedule(async () => {
-    try {
-      const { info } = await fetchInfoWithFallback(id);
-      const fmts = Array.isArray(info?.formats) ? info.formats : [];
+    const results = await Promise.all(ids.map(id =>
+      schedule(async () => {
+        try {
+          const { info } = await fetchInfoWithFallback(id);
+          const fmts = Array.isArray(info?.formats) ? info.formats : [];
 
-      const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
-      if (hasHls) return id; // HLS masters are self-contained for Exo
+          const hasHls = fmts.some(f => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
+          if (hasHls) return id; // HLS masters are self-contained for Exo
 
-      const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
-      const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
-      return (hasVideo && hasAudio) ? id : null;
-    } catch {
-      return null;
-    }
-  })
-));
+          const hasVideo = fmts.some(f => (f?.vcodec && f.vcodec !== "none") && pickUrl(f));
+          const hasAudio = fmts.some(f => (f?.acodec && f.acodec !== "none") && pickUrl(f));
+          return (hasVideo && hasAudio) ? id : null;
+        } catch {
+          return null;
+        }
+      })
+    ));
 
     const playableSet = new Set(results.filter(Boolean));
     const playable = items.filter(it => playableSet.has(it?.id?.videoId));
