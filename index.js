@@ -10,13 +10,15 @@ const os = require("os");
 const path = require("path");
 const zlib = require("zlib");
 
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: "256kb" }));
+
+// ---- Root/health (keep PaaS health checks happy) ----
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
 // ---------- Config ----------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
@@ -87,6 +89,7 @@ if (HAS_COOKIES) {
 } else {
   console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
+
 // ---------- Caches ----------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
 
@@ -300,7 +303,7 @@ function buildFormats(info) {
 
   const audioFormats = formats
     .filter((f) => !isStoryboard(f))
-    .filter((f) => (!f?.vcodec || f?.vcodec === "none") && f?.acodec && f?.acodec !== "none")
+    .filter((f) => (!f?.vcodec || f?.vcodec === "none") && f?.acodec && f.acodec !== "none")
     .map((f) => ({
       format_id: f?.format_id,
       extension: f?.ext || "m4a",
@@ -407,7 +410,7 @@ app.get("/healthz", (_req, res) => {
 app.post("/prewarm", async (req, res) => {
   try {
     const id = String(req.body?.id || "");
-    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream_${id}`;
     if (!cache.get(cacheKey)) {
@@ -426,7 +429,7 @@ app.post("/prewarm", async (req, res) => {
 app.get("/stream", async (req, res) => {
   try {
     const id = String(req.query.id || "");
-    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream_${id}`;
     const hit = cache.get(cacheKey);
@@ -464,7 +467,7 @@ app.get("/stream", async (req, res) => {
 app.get("/stream480", async (req, res) => {
   try {
     const id = String(req.query.id || "");
-    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream480_${id}`;
     const cached = cache.get(cacheKey);
@@ -499,7 +502,7 @@ app.get("/stream480", async (req, res) => {
 app.get("/streamMp4", async (req, res) => {
   try {
     const id = String(req.query.id || "");
-    if (!YT_ID.test(id)) return res.status(400).json({ error: "Bad id" });
+    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Bad id" });
 
     const max = Math.max(144, Math.min(2160, parseInt(req.query.max || "720", 10) || 720));
     const cacheKey = `mp4_${max}_${id}`;
@@ -570,6 +573,7 @@ app.post("/filterPlayable", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+// Listen on all interfaces so PaaS can reach it
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
 });

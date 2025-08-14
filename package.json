@@ -1,16 +1,22 @@
 {
   "name": "yt-backend",
   "version": "1.0.0",
+  "private": true,
+  "description": "Express proxy that fetches YouTube stream formats via yt-dlp",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "diag": "node -v && yt-dlp --version && ffmpeg -version | head -n1",
-    "start": "npm run diag && node index.js"
+    "dev": "nodemon index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "compression": "^1.8.1",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "node-cache": "^5.1.2",
-    "p-limit": "^6.2.0"
-  }
+    "express": "^4.19.2",
+    "node-cache": "^5.1.2"
+  },
+  "license": "UNLICENSED"
 }
