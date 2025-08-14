@@ -8,6 +8,8 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const zlib = require("zlib");
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,23 +36,42 @@ const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS
 
 // ---------- Cookies (Path A: file or base64) ----------
 let YT_COOKIES = process.env.YT_COOKIES || "";
-if (process.env.YT_COOKIES_B64) {
-  try {
+
+try {
+  const b64 = process.env.YT_COOKIES_B64;
+  if (b64 && !YT_COOKIES) {
     const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
-    require("fs").writeFileSync(tmpFile, Buffer.from(process.env.YT_COOKIES_B64, "base64"));
+
+    // Decode (strip any spaces/newlines just in case)
+    const buf = Buffer.from(String(b64).replace(/\s+/g, ""), "base64");
+
+    // Optional safety: keep only the domains we actually need
+    let text = buf.toString("utf8");
+    text =
+      text
+        .split(/\r?\n/)
+        .filter(
+          (l) =>
+            l.startsWith("#") ||
+            /youtube\.com|googlevideo\.com|ytimg\.com/i.test(l)
+        )
+        .join("\n") + "\n";
+
+    fs.writeFileSync(tmpFile, text, "utf8");
     YT_COOKIES = tmpFile;
-  } catch (e) {
-    console.error("Failed to write YT_COOKIES_B64:", e.message);
   }
+} catch (e) {
+  console.error("❌ Failed to materialize YT_COOKIES_B64:", e.message);
 }
-const HAS_COOKIES = !!(YT_COOKIES && require("fs").existsSync(YT_COOKIES));
+
+const HAS_COOKIES = Boolean(YT_COOKIES && fs.existsSync(YT_COOKIES));
 
 if (HAS_COOKIES) {
   try {
-    const stat = require("fs").statSync(YT_COOKIES);
+    const stat = fs.statSync(YT_COOKIES);
     console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES}`);
-  } catch {
-    console.warn("⚠️ Cookies path set but unreadable");
+  } catch (e) {
+    console.warn("⚠️ Cookies path set but unreadable:", e.message);
   }
 } else {
   console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
