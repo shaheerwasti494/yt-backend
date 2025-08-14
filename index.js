@@ -34,13 +34,24 @@ let YT_COOKIES = process.env.YT_COOKIES || "";
 if (process.env.YT_COOKIES_B64) {
   try {
     const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
-    fs.writeFileSync(tmpFile, Buffer.from(process.env.YT_COOKIES_B64, "base64"));
+    require("fs").writeFileSync(tmpFile, Buffer.from(process.env.YT_COOKIES_B64, "base64"));
     YT_COOKIES = tmpFile;
   } catch (e) {
     console.error("Failed to write YT_COOKIES_B64:", e.message);
   }
 }
-const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
+const HAS_COOKIES = !!(YT_COOKIES && require("fs").existsSync(YT_COOKIES));
+
+if (HAS_COOKIES) {
+  try {
+    const stat = require("fs").statSync(YT_COOKIES);
+    console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES}`);
+  } catch {
+    console.warn("⚠️ Cookies path set but unreadable");
+  }
+} else {
+  console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.`);
+}
 
 // ---------- Caches ----------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
