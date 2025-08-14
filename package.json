@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "diag": "node -v && yt-dlp --version && ffmpeg -version | head -n1",
+    "start": "npm run diag && node index.js"
   },
   "dependencies": {
     "compression": "^1.8.1",
