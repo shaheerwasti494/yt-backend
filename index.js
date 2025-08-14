@@ -16,18 +16,18 @@ app.use(express.json({ limit: "256kb" }));
 
 // ---------- Config ----------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds
-const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds
+const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds (info cache)
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds (URL cache)
 const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4);
 const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
 
-// Comma list of clients to try in order
-const YT_CLIENTS = (process.env.YT_CLIENTS || "android,web,tv,ios")
+// Prefer web to expose full adaptive sets; others are fallbacks
+const YT_CLIENTS = (process.env.YT_CLIENTS || "web,android,tv,ios")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Optional cookies file (for age/region)
+// Optional cookies file (for age/region restrictions)
 const YT_COOKIES = process.env.YT_COOKIES;
 const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
 
@@ -104,8 +104,42 @@ const looksLikeHls = (url, proto, ext) =>
 const isStoryboard = (f) =>
   f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
 
+/** Heuristic to pick the “best” info (bigger max height + more adaptive tracks). */
+function scoreInfo(info) {
+  const fmts = Array.isArray(info?.formats) ? info.formats : [];
+  const maxH = fmts.reduce((m, f) => Math.max(m, Number(f?.height) || 0), 0);
+  const adaptiveCount = fmts.filter(
+    (f) => (f?.vcodec && f.vcodec !== "none") && (!f?.acodec || f.acodec === "none")
+  ).length;
+  return maxH * 1000 + adaptiveCount;
+}
+
+/** Merge multiple infos’ formats into a superset (dedup roughly). */
+function mergeInfos(infos) {
+  if (!infos.length) return { formats: [] };
+  const out = { ...infos[0], formats: [] };
+  const seen = new Set();
+  for (const info of infos) {
+    const fmts = Array.isArray(info?.formats) ? info.formats : [];
+    for (const f of fmts) {
+      const url = pickUrl(f);
+      if (!url) continue;
+      const key =
+        String(f?.format_id || "") +
+        "|" + String(f?.ext || "") +
+        "|" + String(f?.protocol || "") +
+        "|" + String(f?.height || "") +
+        "|" + url.slice(0, 80);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.formats.push(f);
+    }
+  }
+  return out;
+}
+
 /** Spawn yt-dlp and return parsed JSON. */
-function spawnYtDlpJSON(url, playerClient = "android") {
+function spawnYtDlpJSON(url, playerClient = "web") {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
@@ -156,7 +190,7 @@ function spawnYtDlpJSON(url, playerClient = "android") {
 }
 
 /** Last-resort: get a single direct URL string via -g -f ... */
-function spawnYtDlpBestUrl(url, playerClient = "android") {
+function spawnYtDlpBestUrl(url, playerClient = "web") {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
@@ -205,28 +239,33 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
   );
 }
 
-/** Try multiple clients and return first JSON with usable formats. */
+/** Try ALL clients, keep the best, and return a MERGED superset of formats. */
 async function fetchInfoWithFallback(id) {
   const url = `https://www.youtube.com/watch?v=${id}`;
-  let lastErr;
+  const tried = [];
+  let best = null;
+
   for (const client of YT_CLIENTS) {
     try {
       const info = await spawnYtDlpJSON(url, client);
       const fmts = Array.isArray(info?.formats) ? info.formats : [];
-      const hasUsable = fmts.some(
-        (f) =>
-          f?.url ||
-          f?.manifest_url ||
-          f?.hls_manifest_url ||
-          f?.dash_manifest_url ||
-          f?.fragment_base_url
-      );
-      if (hasUsable) return { info, client };
-    } catch (e) {
-      lastErr = e;
+      const hasUsable = fmts.some((f) => pickUrl(f));
+      if (hasUsable) {
+        const s = scoreInfo(info);
+        tried.push({ client, info, score: s });
+        if (!best || s > best.score) best = { client, info, score: s };
+      }
+    } catch (_e) {
+      // ignore and continue
     }
   }
-  // As a last resort, return minimal info with one best URL
+
+  if (tried.length) {
+    const merged = mergeInfos(tried.map((t) => t.info));
+    return { info: merged, client: best?.client || tried[0].client };
+  }
+
+  // Last resort: a single best playable URL
   const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
   return {
     info: {
@@ -274,6 +313,7 @@ function buildFormats(info) {
       };
     })
     .filter((fmt) => fmt.url)
+    // de-dupe by (resolution, protocol)
     .filter(
       (fmt, i, arr) =>
         arr.findIndex(
@@ -284,7 +324,6 @@ function buildFormats(info) {
 
   const audioFormats = formats
     .filter((f) => !isStoryboard(f))
-    // FIXED: removed extra closing parenthesis here
     .filter((f) => (!f?.vcodec || f?.vcodec === "none") && f?.acodec && f?.acodec !== "none")
     .map((f) => ({
       format_id: f?.format_id,
@@ -307,7 +346,6 @@ function buildFormats(info) {
 
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
-
   const merged = formats.filter(
     (f) =>
       f?.ext === "mp4" &&
