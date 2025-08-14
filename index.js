@@ -53,7 +53,7 @@ if (HAS_COOKIES) {
     console.warn("⚠️ Cookies path set but unreadable");
   }
 } else {
-  console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.`);
+  console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
 
 // ---------- Caches ----------
