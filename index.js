@@ -36,36 +36,47 @@ const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS
 
 // ---------- Cookies (Path A: file or base64) ----------
 let YT_COOKIES = process.env.YT_COOKIES || "";
+const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
+const B64    = process.env.YT_COOKIES_B64     || "";
+
+// Safe debug (lengths only)
+if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
+if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
+
+// Filter to only domains we need (keeps comments/header lines)
+function filterDomains(text) {
+  return (
+    text
+      .split(/\r?\n/)
+      .filter(
+        (l) =>
+          l.startsWith("#") ||
+          /youtube\.com|googlevideo\.com|ytimg\.com/i.test(l)
+      )
+      .join("\n") + "\n"
+  );
+}
 
 try {
-  const b64 = process.env.YT_COOKIES_B64;
-  if (b64 && !YT_COOKIES) {
+  if (!YT_COOKIES && (B64_GZ || B64)) {
     const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
-
-    // Decode (strip any spaces/newlines just in case)
-    const buf = Buffer.from(String(b64).replace(/\s+/g, ""), "base64");
-
-    // Optional safety: keep only the domains we actually need
-    let text = buf.toString("utf8");
-    text =
-      text
-        .split(/\r?\n/)
-        .filter(
-          (l) =>
-            l.startsWith("#") ||
-            /youtube\.com|googlevideo\.com|ytimg\.com/i.test(l)
-        )
-        .join("\n") + "\n";
-
-    fs.writeFileSync(tmpFile, text, "utf8");
+    if (B64_GZ) {
+      // gzip+base64 → text
+      const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
+      const text = zlib.gunzipSync(raw).toString("utf8");
+      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
+    } else if (B64) {
+      // base64 → text
+      const text = Buffer.from(String(B64).replace(/\s+/g, ""), "base64").toString("utf8");
+      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
+    }
     YT_COOKIES = tmpFile;
   }
 } catch (e) {
-  console.error("❌ Failed to materialize YT_COOKIES_B64:", e.message);
+  console.error("❌ Failed to materialize cookies:", e.message);
 }
 
 const HAS_COOKIES = Boolean(YT_COOKIES && fs.existsSync(YT_COOKIES));
-
 if (HAS_COOKIES) {
   try {
     const stat = fs.statSync(YT_COOKIES);
@@ -76,7 +87,6 @@ if (HAS_COOKIES) {
 } else {
   console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
-
 // ---------- Caches ----------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
 
