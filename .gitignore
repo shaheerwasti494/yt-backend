@@ -1,0 +1,7 @@
+cat > .gitignore << 'EOF'
+node_modules
+cookies.txt
+cookies.b64
+.env
+.DS_Store
+EOF

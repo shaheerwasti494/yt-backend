@@ -6,6 +6,8 @@ const compression = require("compression");
 const NodeCache = require("node-cache");
 const { spawn } = require("child_process");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,8 +29,17 @@ const YT_CLIENTS = (process.env.YT_CLIENTS || "web,android,tv,ios")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Optional cookies file (for age/region restrictions)
-const YT_COOKIES = process.env.YT_COOKIES;
+// ---------- Cookies (Path A: file or base64) ----------
+let YT_COOKIES = process.env.YT_COOKIES || "";
+if (process.env.YT_COOKIES_B64) {
+  try {
+    const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
+    fs.writeFileSync(tmpFile, Buffer.from(process.env.YT_COOKIES_B64, "base64"));
+    YT_COOKIES = tmpFile;
+  } catch (e) {
+    console.error("Failed to write YT_COOKIES_B64:", e.message);
+  }
+}
 const HAS_COOKIES = !!(YT_COOKIES && fs.existsSync(YT_COOKIES));
 
 // ---------- Caches ----------
@@ -81,13 +92,10 @@ function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {})
       const remain = exp - now - safety;
       return Math.max(floor, Math.min(ceil, remain));
     }
-  } catch (_e) {
-    // ignore
-  }
+  } catch (_e) {}
   return URL_TTL_FALLBACK;
 }
 
-// Shared small helpers
 const pickUrl = (f) =>
   f?.url ||
   f?.manifest_url ||
@@ -159,9 +167,7 @@ function spawnYtDlpJSON(url, playerClient = "web") {
         let out = "";
         let err = "";
         const timer = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+          try { child.kill("SIGKILL"); } catch {}
         }, YTDLP_TIMEOUT_MS);
 
         child.stdout.setEncoding("utf8");
@@ -212,9 +218,7 @@ function spawnYtDlpBestUrl(url, playerClient = "web") {
         let out = "";
         let err = "";
         const timer = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
+          try { child.kill("SIGKILL"); } catch {}
         }, YTDLP_TIMEOUT_MS);
 
         child.stdout.setEncoding("utf8");
@@ -350,10 +354,8 @@ function pickBestMergedMp4(info, maxHeight) {
     (f) =>
       f?.ext === "mp4" &&
       pickUrl(f) &&
-      f?.vcodec &&
-      f.vcodec !== "none" &&
-      f?.acodec &&
-      f.acodec !== "none" &&
+      f?.vcodec && f.vcodec !== "none" &&
+      f?.acodec && f.acodec !== "none" &&
       f?.height
   );
   if (!merged.length) return null;
