@@ -58,17 +58,21 @@ if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
 function filterDomains(text) {
+  // Keep comments AND auth-critical Google domains, not just youtube/*
+  const keepers = [
+    /^#/,                            // comments + #HttpOnly_
+    /(^|\s)\.?(youtube|googlevideo|ytimg)\.com\s/i,
+    /(^|\s)\.?(google|accounts\.google)\.com\s/i,
+    /(^|\s)\.?(gstatic|youtube\-nocookie)\.com\s/i,
+  ];
   return (
     text
       .split(/\r?\n/)
-      .filter(
-        (l) =>
-          l.startsWith("#") ||
-          /youtube\.com|googlevideo\.com|ytimg\.com/i.test(l)
-      )
+      .filter((l) => l.trim() === "" || keepers.some((re) => re.test(l)))
       .join("\n") + "\n"
   );
 }
+
 
 try {
   if (!YT_COOKIES && (B64_GZ || B64)) {
