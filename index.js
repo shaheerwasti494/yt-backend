@@ -17,10 +17,10 @@ app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: "256kb" }));
 
-// ---- Root/health (keep PaaS health checks happy) ----
+// ---- Root/health ----------------------------------------------------------------
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// ---------- Config ----------
+// ---------- Config ---------------------------------------------------------------
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds (info cache)
 const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds (URL cache)
@@ -36,8 +36,18 @@ const YT_CLIENTS = (process.env.YT_CLIENTS || "android,tv,web,ios")
 // Return the first good client immediately, but wait this long (ms) to merge late arrivals (optional)
 const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS || 250);
 
-// ---------- Cookies (Path A: file or base64) ----------
-let YT_COOKIES = process.env.YT_COOKIES || "";
+// ---------- Cookies: best-practice materialization -------------------------------
+
+/**
+ * We support three ways to supply cookies:
+ * 1) YT_COOKIES -> path to Netscape cookie file (best)
+ * 2) YT_COOKIES_B64_GZ -> base64(gzip(cookie.txt))
+ * 3) YT_COOKIES_B64    -> base64(cookie.txt)
+ *
+ * We do NOT filter domains (keeps *.google.com + accounts.google.com needed for SAPISIDHASH).
+ */
+
+let YT_COOKIES_PATH = process.env.YT_COOKIES || ""; // If set to a readable file, we use it verbatim.
 const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
 const B64    = process.env.YT_COOKIES_B64     || "";
 
@@ -45,55 +55,70 @@ const B64    = process.env.YT_COOKIES_B64     || "";
 if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
-// Filter to only domains we need (keeps comments/header lines)
-function filterDomains(text) {
-  return (
-    text
-      .split(/\r?\n/)
-      .filter(
-        (l) =>
-          l.startsWith("#") ||
-          /youtube\.com|googlevideo\.com|ytimg\.com/i.test(l)
-      )
-      .join("\n") + "\n"
-  );
+function decodeB64(s) {
+  try { return Buffer.from(String(s).replace(/\s+/g, ""), "base64").toString("utf8"); }
+  catch { return ""; }
+}
+function decodeB64Gz(s) {
+  try { return zlib.gunzipSync(Buffer.from(String(s).replace(/\s+/g, ""), "base64")).toString("utf8"); }
+  catch { return ""; }
+}
+function cookieScore(txt) {
+  // reward presence of auth/consent cookies vital for YouTube internal API calls
+  const names = [
+    "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID",
+    "APISID", "SID", "HSID", "SSID", "CONSENT", "SOCS"
+  ];
+  const hits = names.reduce((n, k) => n + (txt.includes(`\t${k}\t`) ? 1 : 0), 0);
+  return hits * 100000 + txt.length; // hits first, then size
+}
+function writeTempCookies(text) {
+  const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
+  fs.writeFileSync(tmpFile, text, "utf8"); // NO FILTERING
+  return tmpFile;
 }
 
+// Materialize cookies if no file path provided but B64 data exists
 try {
-  if (!YT_COOKIES && (B64_GZ || B64)) {
-    const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
-    if (B64_GZ) {
-      // gzip+base64 → text
-      const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
-      const text = zlib.gunzipSync(raw).toString("utf8");
-      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
-    } else if (B64) {
-      // base64 → text
-      const text = Buffer.from(String(B64).replace(/\s+/g, ""), "base64").toString("utf8");
-      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
-    }
-    YT_COOKIES = tmpFile;
+  const pathLooksGood = YT_COOKIES_PATH && fs.existsSync(YT_COOKIES_PATH) && fs.statSync(YT_COOKIES_PATH).isFile();
+  if (!pathLooksGood && (B64_GZ || B64)) {
+    const candidates = [];
+    if (B64_GZ) candidates.push(decodeB64Gz(B64_GZ));
+    if (B64)    candidates.push(decodeB64(B64));
+    const valid = candidates.filter(Boolean);
+    if (!valid.length) throw new Error("No decodable cookie payloads found");
+
+    // pick best by cookieScore
+    const best = valid.sort((a, b) => cookieScore(b) - cookieScore(a))[0];
+    YT_COOKIES_PATH = writeTempCookies(best);
   }
 } catch (e) {
   console.error("❌ Failed to materialize cookies:", e.message);
 }
 
-const HAS_COOKIES = Boolean(YT_COOKIES && fs.existsSync(YT_COOKIES));
-if (HAS_COOKIES) {
+// Sanity log + size
+let HAS_COOKIES = false;
+if (YT_COOKIES_PATH) {
   try {
-    const stat = fs.statSync(YT_COOKIES);
-    console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES}`);
+    const stat = fs.statSync(YT_COOKIES_PATH);
+    const txt = fs.readFileSync(YT_COOKIES_PATH, "utf8");
+    const want = ["SAPISID","__Secure-3PAPISID","CONSENT","SOCS"];
+    const present = want.filter(n => txt.includes(`\t${n}\t`));
+    console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES_PATH}`);
+    console.log("🔎 Cookie sanity:", present.join(", ") || "(none)");
+    HAS_COOKIES = true;
   } catch (e) {
     console.warn("⚠️ Cookies path set but unreadable:", e.message);
   }
-} else {
-  console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
+}
+if (!HAS_COOKIES) {
+  console.warn("⚠️ No cookies available. Age/region/anti-bot checks may fail.");
 }
 
-// ---------- Caches ----------
+// ---------- Caches ----------------------------------------------------------------
 const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
 
-// ---------- Concurrency (semaphore) ----------
+// ---------- Concurrency (semaphore) -----------------------------------------------
 let running = 0;
 const queue = [];
 function schedule(fn) {
@@ -120,7 +145,7 @@ function tick() {
   }
 }
 
-// ---------- Helpers ----------
+// ---------- Helpers ----------------------------------------------------------------
 const YT_ID = /^[\w-]{11}$/;
 
 function setCacheHeaders(res, seconds, extra = "public") {
@@ -207,7 +232,7 @@ function spawnYtDlpJSON(url, playerClient = "android") {
           `youtube:player_client=${playerClient}`,
         ];
         if (HAS_COOKIES) {
-          args.push("--cookies", YT_COOKIES);
+          args.push("--cookies", YT_COOKIES_PATH);
         }
         args.push(url);
 
@@ -244,7 +269,7 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
           "-f",
           'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
         ];
-        if (HAS_COOKIES) args.push("--cookies", YT_COOKIES);
+        if (HAS_COOKIES) args.push("--cookies", YT_COOKIES_PATH);
         args.push(url);
 
         const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -334,10 +359,10 @@ function pickBestMergedMp4(info, maxHeight) {
   return merged.filter((f) => f.height > maxHeight).sort((a, b) => a.height - b.height)[0] || null;
 }
 
-// ---------- In-flight de-dup (coalesce) ----------
+// ---------- In-flight de-dup (coalesce) -------------------------------------------
 const inflight = new Map(); // key: `stream_${id}` -> Promise<{videoFormats,audioFormats}>
 
-// ---------- Fast parallel fetch & merge ----------
+// ---------- Fast parallel fetch & merge -------------------------------------------
 async function fetchInfoMergedFast(id) {
   const url = `https://www.youtube.com/watch?v=${id}`;
 
@@ -400,7 +425,7 @@ async function fetchInfoMergedFast(id) {
   return { info: merged, client: best?.client || first.client };
 }
 
-// ---------- Routes ----------
+// ---------- Routes ----------------------------------------------------------------
 
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true, running, queued: queue.length, cacheKeys: cache.keys().length });
@@ -421,7 +446,7 @@ app.post("/prewarm", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("/prewarm error:", e.message);
-    res.status(500).json({ error: "Failed to prewarm" });
+    res.status(500).json({ error: "Failed to prewarm", detail: e.message });
   }
 });
 
@@ -459,7 +484,7 @@ app.get("/stream", async (req, res) => {
     res.json(result);
   } catch (e) {
     console.error("/stream error:", e.message);
-    res.status(500).json({ error: "Failed to fetch formats" });
+    res.status(500).json({ error: "Failed to fetch formats", detail: e.message });
   }
 });
 
@@ -494,7 +519,7 @@ app.get("/stream480", async (req, res) => {
     res.redirect(url);
   } catch (e) {
     console.error("/stream480 error:", e.message);
-    res.status(500).json({ error: "Failed to pick 480p stream" });
+    res.status(500).json({ error: "Failed to pick 480p stream", detail: e.message });
   }
 });
 
@@ -569,7 +594,7 @@ app.post("/filterPlayable", async (req, res) => {
     res.json({ playable });
   } catch (e) {
     console.error("/filterPlayable error:", e.message);
-    res.status(500).json({ error: "Failed to filter" });
+    res.status(500).json({ error: "Failed to filter", detail: e.message });
   }
 });
 
