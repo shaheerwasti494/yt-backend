@@ -469,32 +469,45 @@ async function fetchInfoMergedFast(id) {
       })
   );
 
-  // First good client
   let first;
   try {
+    // First client that returns usable JSON wins fast-path
     first = await Promise.any(all);
   } catch (e) {
-    if (e?.code === "AUTH_REQUIRED") throw e;
-    const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
-    return {
-      info: {
-        id,
-        formats: [
-          {
-            format_id: "best",
-            ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
-            protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
-            vcodec: "unknown",
-            acodec: "unknown",
-            url: bestUrl,
-          },
-        ],
-      },
-      client: "best-url",
-    };
+    // NEW: regardless of why JSON failed (including AUTH_REQUIRED),
+    // attempt last-resort direct URL via -g (which already retries w/o cookies).
+    try {
+      const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
+      return {
+        info: {
+          id,
+          formats: [
+            {
+              format_id: "best",
+              ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
+              protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
+              vcodec: "unknown",
+              acodec: "unknown",
+              url: bestUrl,
+            },
+          ],
+        },
+        client: "best-url",
+      };
+    } catch (eg) {
+      // If either the JSON batch or the -g fallback was AUTH-gated, surface AUTH_REQUIRED.
+      const authy = (e && e.code === "AUTH_REQUIRED") || (eg && eg.code === "AUTH_REQUIRED");
+      if (authy) {
+        const err = new Error("Auth required");
+        err.code = "AUTH_REQUIRED";
+        throw err;
+      }
+      // otherwise, throw the -g error (more actionable)
+      throw eg;
+    }
   }
 
-  // Optionally wait a short window to gather more results to merge
+  // Optionally wait a small window to merge late JSON successes
   const gather = Promise.allSettled(all);
   const timed = await Promise.race([
     gather,
@@ -513,7 +526,6 @@ async function fetchInfoMergedFast(id) {
   const best = successes.sort((a, b) => b.score - a.score)[0];
   return { info: merged, client: best?.client || first.client };
 }
-
 // ========= Backpressure helper =========
 function rejectIfBusy(res) {
   if (queue.length > MAX_QUEUE) {
