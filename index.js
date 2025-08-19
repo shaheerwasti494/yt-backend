@@ -100,20 +100,34 @@ function validateCookieJar(str) {
   if (!okYouTube) console.warn("⚠️ youtube.com cookies missing basic tokens (CONSENT/YSC/etc).");
 }
 
+// Always materialize a writable copy for yt-dlp (Cloud Run secrets are read-only)
+function writeTmpCookies(text) {
+  const dest = path.join(os.tmpdir(), "youtube.cookies.txt");
+  const finalText = NO_COOKIE_FILTER ? text : filterDomains(text);
+  fs.writeFileSync(dest, finalText, "utf8");
+  try { fs.chmodSync(dest, 0o600); } catch {}
+  console.log(`🔁 Cookies materialized to ${dest} (${finalText.length} bytes)`);
+  return dest;
+}
+
 try {
   if (!YT_COOKIES && (B64_GZ || B64)) {
-    const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt"); // Cloud Run-friendly
+    // No path provided; materialize from env-encoded content
     if (B64_GZ) {
       const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
       const text = zlib.gunzipSync(raw).toString("utf8");
       validateCookieJar(text);
-      fs.writeFileSync(tmpFile, NO_COOKIE_FILTER ? text : filterDomains(text), "utf8");
+      YT_COOKIES = writeTmpCookies(text);
     } else if (B64) {
       const text = Buffer.from(String(B64).replace(/\s+/g, ""), "base64").toString("utf8");
       validateCookieJar(text);
-      fs.writeFileSync(tmpFile, NO_COOKIE_FILTER ? text : filterDomains(text), "utf8");
+      YT_COOKIES = writeTmpCookies(text);
     }
-    YT_COOKIES = tmpFile;
+  } else if (YT_COOKIES && fs.existsSync(YT_COOKIES)) {
+    // Path provided (e.g., mounted secret). Copy to /tmp so yt-dlp can write/normalize.
+    const srcText = fs.readFileSync(YT_COOKIES, "utf8");
+    validateCookieJar(srcText);
+    YT_COOKIES = writeTmpCookies(srcText);
   }
 } catch (e) {
   console.error("❌ Failed to materialize cookies:", e.message);
