@@ -456,6 +456,7 @@ function pickBestMergedMp4(info, maxHeight) {
 const inflight = new Map(); // key: `stream_${id}` -> Promise<{result, client}>
 
 // ========= Fast parallel fetch & merge =========
+// ========= Fast parallel fetch & merge (now with AUTH-safe -g fallback) =========
 async function fetchInfoMergedFast(id) {
   const url = `https://www.youtube.com/watch?v=${id}`;
 
@@ -526,6 +527,7 @@ async function fetchInfoMergedFast(id) {
   const best = successes.sort((a, b) => b.score - a.score)[0];
   return { info: merged, client: best?.client || first.client };
 }
+
 // ========= Backpressure helper =========
 function rejectIfBusy(res) {
   if (queue.length > MAX_QUEUE) {
