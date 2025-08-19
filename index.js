@@ -1,5 +1,13 @@
 "use strict";
 
+/**
+ * PrimeTube yt-dlp microservice (optimized)
+ * - Parallel client probing (android/tv/web/ios) with tiny merge window
+ * - In-flight request coalescing & short-lived format cache
+ * - Backpressure & bounded yt-dlp concurrency
+ * - Robust cookie handling (keeps google.com/accounts.google.com auth cookies)
+ */
+
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
@@ -11,7 +19,7 @@ const path = require("path");
 const zlib = require("zlib");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
@@ -21,8 +29,9 @@ app.use(cors());
 app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: "256kb" }));
 
-// ---- Root/health (keep PaaS health checks happy) ----
+// ---- Root/health/robots ----
 app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/robots.txt", (_req, res) => res.type("text/plain").send("User-agent: *\nDisallow:\n"));
 
 // ========= Config =========
 const VCPUS = Number(process.env.CPU_LIMIT || os.cpus().length || 1);
@@ -49,18 +58,26 @@ const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS
 // Backpressure: fail fast when queue explodes so autoscaling can pick up
 const MAX_QUEUE = Number(process.env.MAX_QUEUE || 64);
 
-// ========= Cookies (Path A: file or base64) =========
-let YT_COOKIES = process.env.YT_COOKIES || "";
+// ========= Cookies =========
+// You can supply cookies one of four ways (first one that exists is used):
+// 1) YT_COOKIES_PATH: absolute path to Netscape cookie file
+// 2) YT_COOKIES: path (legacy variable name)
+// 3) YT_COOKIES_B64_GZ: base64(gzip(cookie_file))
+// 4) YT_COOKIES_B64: base64(cookie_file)
+// You may set NO_COOKIE_FILTER=1 to skip domain filtering entirely.
+let YT_COOKIES = process.env.YT_COOKIES_PATH || process.env.YT_COOKIES || "";
 const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
 const B64    = process.env.YT_COOKIES_B64     || "";
+const NO_COOKIE_FILTER = /^1|true$/i.test(String(process.env.NO_COOKIE_FILTER || ""));
 
+// Safe debug (lengths only)
 if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
+// Keep comments AND auth-critical Google domains (not just youtube/*)
 function filterDomains(text) {
-  // Keep comments AND auth-critical Google domains, not just youtube/*
   const keepers = [
-    /^#/,                            // comments + #HttpOnly_
+    /^#/, // comments + #HttpOnly_ etc
     /(^|\s)\.?(youtube|googlevideo|ytimg)\.com\s/i,
     /(^|\s)\.?(google|accounts\.google)\.com\s/i,
     /(^|\s)\.?(gstatic|youtube\-nocookie)\.com\s/i,
@@ -73,6 +90,15 @@ function filterDomains(text) {
   );
 }
 
+function hasAny(str, names) {
+  return names.some((n) => new RegExp(`\\t${n}\\t`, "i").test(str));
+}
+function validateCookieJar(str) {
+  const okGoogle   = hasAny(str, ["SID","HSID","SSID","APISID","SAPISID","__Secure-3PAPISID"]);
+  const okYouTube  = hasAny(str, ["CONSENT","YSC","PREF","VISITOR_INFO1_LIVE"]);
+  if (!okGoogle) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID/etc). Export from your daily browser profile while signed in.");
+  if (!okYouTube) console.warn("⚠️ youtube.com cookies missing basic tokens (CONSENT/YSC/etc).");
+}
 
 try {
   if (!YT_COOKIES && (B64_GZ || B64)) {
@@ -80,10 +106,12 @@ try {
     if (B64_GZ) {
       const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
       const text = zlib.gunzipSync(raw).toString("utf8");
-      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
+      validateCookieJar(text);
+      fs.writeFileSync(tmpFile, NO_COOKIE_FILTER ? text : filterDomains(text), "utf8");
     } else if (B64) {
       const text = Buffer.from(String(B64).replace(/\s+/g, ""), "base64").toString("utf8");
-      fs.writeFileSync(tmpFile, filterDomains(text), "utf8");
+      validateCookieJar(text);
+      fs.writeFileSync(tmpFile, NO_COOKIE_FILTER ? text : filterDomains(text), "utf8");
     }
     YT_COOKIES = tmpFile;
   }
@@ -141,7 +169,7 @@ function tick() {
 const YT_ID = /^[\w-]{11}$/;
 
 function setCacheHeaders(res, seconds, extra = "public") {
-  // add stale-while-revalidate for smoother cache behavior
+  // Add stale-while-revalidate for smoother cache behavior/CDN
   res.set(
     "Cache-Control",
     `${extra}, max-age=${seconds}, s-maxage=${seconds}, stale-while-revalidate=${Math.ceil(seconds / 2)}`
@@ -154,6 +182,7 @@ function setShortPrivate(res, seconds = 60) {
   );
 }
 
+/** Parse 'expire' from googlevideo-style URLs for adaptive TTL. */
 function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {}) {
   try {
     const u = new URL(urlStr);
@@ -183,6 +212,7 @@ const looksLikeHls = (url, proto, ext) =>
 const isStoryboard = (f) =>
   f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
 
+/** Heuristic to pick the “best” info (bigger max height + more adaptive tracks). */
 function scoreInfo(info) {
   const fmts = Array.isArray(info?.formats) ? info.formats : [];
   const maxH = fmts.reduce((m, f) => Math.max(m, Number(f?.height) || 0), 0);
@@ -192,6 +222,7 @@ function scoreInfo(info) {
   return maxH * 1000 + adaptiveCount;
 }
 
+/** Merge multiple infos’ formats into a superset (dedup roughly). */
 function mergeInfos(infos) {
   if (!infos.length) return { formats: [] };
   const out = { ...infos[0], formats: [] };
@@ -324,6 +355,7 @@ function buildFormats(info) {
       };
     })
     .filter((fmt) => fmt.url)
+    // keep both progressive and HLS at each height
     .filter((fmt, i, arr) => arr.findIndex(
       (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
     ) === i)
@@ -402,6 +434,7 @@ async function fetchInfoMergedFast(id) {
     };
   }
 
+  // Optionally wait a short window to gather more results to merge
   const gather = Promise.allSettled(all);
   const timed = await Promise.race([
     gather,
@@ -409,14 +442,17 @@ async function fetchInfoMergedFast(id) {
   ]);
 
   if (timed === "timeout") {
+    // Just return first (fast path)
     return { info: first.info, client: first.client };
   }
 
-  const successes = timed
+  // Merge everything that succeeded
+  const successes = /** @type {Array<{value?: any, status: string}>} */ (timed)
     .filter((s) => s.status === "fulfilled")
     .map((s) => s.value);
 
   const merged = mergeInfos(successes.map((t) => t.info));
+  // Pick best client label for logging
   const best = successes.sort((a, b) => b.score - a.score)[0];
   return { info: merged, client: best?.client || first.client };
 }
@@ -479,11 +515,12 @@ app.get("/stream", async (req, res) => {
       return res.json(hit);
     }
 
+    // In-flight coalescing
     if (!inflight.has(cacheKey)) {
       inflight.set(cacheKey, (async () => {
         const { info, client } = await fetchInfoMergedFast(id);
         const result = buildFormats(info);
-        cache.set(cacheKey, result, 60); // brief; URLs enforce their own expiry
+        cache.set(cacheKey, result, 60); // brief; URLs enforce their own expiry anyway
         return { result, client };
       })().finally(() => {
         setTimeout(() => inflight.delete(cacheKey), 0);
@@ -615,6 +652,10 @@ app.post("/filterPlayable", async (req, res) => {
 
 // ========= Graceful shutdown =========
 process.on("SIGTERM", () => {
+  for (const pid of [...children]) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  process.exit(0);
+});
+process.on("SIGINT", () => {
   for (const pid of [...children]) { try { process.kill(pid, "SIGKILL"); } catch {} }
   process.exit(0);
 });
