@@ -7,7 +7,7 @@
  * - Backpressure & bounded yt-dlp concurrency
  * - Robust cookie handling (path / base64-gzip / base64) with domain filtering
  * - Auth-aware error mapping (403 for anti-bot), cookie health introspection
- * - Stale-on-auth fallback: serve last known good formats/URLs when YouTube challenges
+ * - NEW: auth-wall fallback (retry without cookies if cookie’d attempt is challenged)
  */
 
 const express = require("express");
@@ -170,12 +170,6 @@ const cache = new NodeCache({
   checkperiod: Math.max(30, Math.min(INFO_TTL, 120)), // keep memory tidy
   useClones: false
 });
-// Longer-lived backup of last good results (used when yt-dlp hits auth wall)
-const lastGood = new NodeCache({
-  stdTTL: Number(process.env.LASTGOOD_TTL || 21600), // 6h
-  checkperiod: 300,
-  useClones: false
-});
 
 // ========= Concurrency (semaphore) =========
 let running = 0;
@@ -292,7 +286,7 @@ function track(child) {
   return child;
 }
 
-// ========= yt-dlp invocations & error mapping =========
+// ========= Error helpers =========
 function isAuthWallError(msg = "") {
   const s = String(msg);
   return /Sign in to confirm you.?re not a bot/i.test(s) ||
@@ -300,6 +294,7 @@ function isAuthWallError(msg = "") {
          /account associated/i.test(s);
 }
 
+// ========= yt-dlp invocations (with auth-wall fallback) =========
 function spawnYtDlpJSON(url, playerClient = "android", useCookies = true) {
   return schedule(
     () =>
@@ -317,7 +312,8 @@ function spawnYtDlpJSON(url, playerClient = "android", useCookies = true) {
         args.push(url);
 
         const child = track(spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] }));
-        let out = "", err = "";
+        let out = "";
+        let err = "";
         const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
         child.stdout.setEncoding("utf8");
@@ -330,8 +326,7 @@ function spawnYtDlpJSON(url, playerClient = "android", useCookies = true) {
           if (!out && code !== 0) {
             const em = `yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`;
             if (isAuthWallError(em) && useCookies && HAS_COOKIES) {
-              console.warn("⚠️ AUTH wall with cookies; retrying without cookies…");
-              // retry once WITHOUT cookies
+              console.warn("⚠️ AUTH wall with cookies; retrying JSON without cookies…");
               spawnYtDlpJSON(url, playerClient, false).then(resolve).catch(reject);
               return;
             }
@@ -339,8 +334,7 @@ function spawnYtDlpJSON(url, playerClient = "android", useCookies = true) {
             if (isAuthWallError(em)) e.code = "AUTH_REQUIRED";
             return reject(e);
           }
-          try { resolve(JSON.parse(out)); }
-          catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
+          try { resolve(JSON.parse(out)); } catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
         });
       })
   );
@@ -392,7 +386,6 @@ function spawnYtDlpBestUrl(url, playerClient = "android", useCookies = true) {
       })
   );
 }
-
 
 // ========= Format assembly =========
 function buildFormats(info) {
@@ -554,9 +547,7 @@ app.post("/prewarm", async (req, res) => {
     const cacheKey = `stream_${id}`;
     if (!cache.get(cacheKey)) {
       const { info } = await fetchInfoMergedFast(id);
-      const result = buildFormats(info);
-      cache.set(cacheKey, result, 60);
-      lastGood.set(cacheKey, { result, at: Date.now() });
+      cache.set(cacheKey, buildFormats(info), 60);
     }
     setShortPrivate(res, 15);
     res.json({ ok: true });
@@ -575,9 +566,9 @@ app.post("/prewarm", async (req, res) => {
 
 // Formats JSON (short private cache). Uses fast-first + tiny merge window.
 app.get("/stream", async (req, res) => {
-  const id = String(req.query.id || "").trim().replace(/^\$/, "");
   try {
     if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
     if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream_${id}`;
@@ -593,8 +584,7 @@ app.get("/stream", async (req, res) => {
       inflight.set(cacheKey, (async () => {
         const { info, client } = await fetchInfoMergedFast(id);
         const result = buildFormats(info);
-        cache.set(cacheKey, result, 60);              // short for freshness
-        lastGood.set(cacheKey, { result, at: Date.now() }); // remember last good
+        cache.set(cacheKey, result, 60); // brief; URLs enforce their own expiry anyway
         return { result, client };
       })().finally(() => {
         setTimeout(() => inflight.delete(cacheKey), 0);
@@ -607,12 +597,6 @@ app.get("/stream", async (req, res) => {
     res.json(result);
   } catch (e) {
     if (e?.code === "AUTH_REQUIRED") {
-      const lg = lastGood.get(`stream_${id}`);
-      if (lg?.result) {
-        res.set("X-PT-Stale", "lastGood");
-        setShortPrivate(res, 30);
-        return res.json(lg.result);
-      }
       res.set("X-PT-Auth", "MISSING");
       return res.status(403).json({
         error: "YouTube requires sign-in (anti-bot). Provide cookies.",
@@ -627,9 +611,9 @@ app.get("/stream", async (req, res) => {
 
 // Redirect to a merged MP4 close to 480p (uses URL expiry for TTL)
 app.get("/stream480", async (req, res) => {
-  const id = String(req.query.id || "").trim().replace(/^\$/, "");
   try {
     if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
     if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream480_${id}`;
@@ -645,7 +629,6 @@ app.get("/stream480", async (req, res) => {
     if (fmt?.url) {
       const ttl = computeUrlTtlSec(fmt.url);
       cache.set(cacheKey, fmt.url, ttl);
-      lastGood.set(cacheKey, { url: fmt.url, at: Date.now() });
       res.set("X-PT-Cache", "MISS");
       setCacheHeaders(res, ttl);
       return res.redirect(fmt.url);
@@ -654,17 +637,10 @@ app.get("/stream480", async (req, res) => {
     const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
     const ttl = computeUrlTtlSec(url);
     cache.set(cacheKey, url, ttl);
-    lastGood.set(cacheKey, { url, at: Date.now() });
     setCacheHeaders(res, ttl);
     res.redirect(url);
   } catch (e) {
     if (e?.code === "AUTH_REQUIRED") {
-      const lg = lastGood.get(`stream480_${id}`);
-      if (lg?.url) {
-        res.set("X-PT-Stale", "lastGood");
-        setCacheHeaders(res, computeUrlTtlSec(lg.url));
-        return res.redirect(lg.url);
-      }
       res.set("X-PT-Auth", "MISSING");
       return res.status(403).json({ error: "Auth required for this video", code: "AUTH_REQUIRED", checks: COOKIE_HEALTH });
     }
@@ -675,9 +651,9 @@ app.get("/stream480", async (req, res) => {
 
 // Redirect to best merged MP4 under ?max= (uses URL expiry for TTL)
 app.get("/streamMp4", async (req, res) => {
-  const id = String(req.query.id || "").trim().replace(/^\$/, "");
   try {
     if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
     if (!YT_ID.test(id)) return res.status(400).json({ error: "Bad id" });
 
     const max = Math.max(144, Math.min(2160, parseInt(req.query.max || "720", 10) || 720));
@@ -694,7 +670,6 @@ app.get("/streamMp4", async (req, res) => {
     if (fmt?.url) {
       const ttl = computeUrlTtlSec(fmt.url);
       cache.set(cacheKey, fmt.url, ttl);
-      lastGood.set(cacheKey, { url: fmt.url, at: Date.now() });
       res.set("X-PT-Cache", "MISS");
       setCacheHeaders(res, ttl);
       return res.redirect(fmt.url);
@@ -703,18 +678,10 @@ app.get("/streamMp4", async (req, res) => {
     const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
     const ttl = computeUrlTtlSec(url);
     cache.set(cacheKey, url, ttl);
-    lastGood.set(cacheKey, { url, at: Date.now() });
     setCacheHeaders(res, ttl);
     res.redirect(url);
   } catch (e) {
     if (e?.code === "AUTH_REQUIRED") {
-      const max = Math.max(144, Math.min(2160, parseInt(req.query.max || "720", 10) || 720));
-      const lg = lastGood.get(`mp4_${max}_${id}`);
-      if (lg?.url) {
-        res.set("X-PT-Stale", "lastGood");
-        setCacheHeaders(res, computeUrlTtlSec(lg.url));
-        return res.redirect(lg.url);
-      }
       res.set("X-PT-Auth", "MISSING");
       return res.status(403).json({ error: "Auth required for this video", code: "AUTH_REQUIRED", checks: COOKIE_HEALTH });
     }
