@@ -12,6 +12,7 @@
  *    • Default client order prefers TV/Android
  *    • COOKIE_CLIENTS (e.g. "web" default) to avoid cookie use on TV/Android
  *    • FORCE_NO_COOKIES=1 or per-request ?nocookie=1
+ *    • COOKIE_ALL_ON_AUTH=1 → if any auth-wall is hit, retry -g forcing cookies on *all* clients
  */
 
 const express = require("express");
@@ -62,6 +63,9 @@ const COOKIE_CLIENTS = (process.env.COOKIE_CLIENTS || "web")
 
 // Force disabling cookies globally (e.g. to test)
 const FORCE_NO_COOKIES = /^1|true$/i.test(String(process.env.FORCE_NO_COOKIES || ""));
+
+// NEW: if auth wall is detected, allow a final pass forcing cookies on all clients
+const COOKIE_ALL_ON_AUTH = /^1|true$/i.test(String(process.env.COOKIE_ALL_ON_AUTH || ""));
 
 // Small merge window
 const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS || 150);
@@ -161,7 +165,8 @@ app.get("/cookiez", (_req, res) => {
     path: HAS_COOKIES ? YT_COOKIES : null,
     checks: COOKIE_HEALTH,
     cookieClients: COOKIE_CLIENTS,
-    forceNoCookies: FORCE_NO_COOKIES
+    forceNoCookies: FORCE_NO_COOKIES,
+    cookieAllOnAuth: COOKIE_ALL_ON_AUTH
   });
 });
 
@@ -272,8 +277,9 @@ function isAuthWallError(msg = "") {
       || /This video may be inappropriate/i.test(s)
       || /account associated/i.test(s);
 }
-function willUseCookiesFor(client, requestedUseCookies) {
-  return requestedUseCookies && HAS_COOKIES && COOKIE_CLIENTS.includes(String(client || "").toLowerCase());
+// UPDATED: allow forcing cookies on all clients
+function willUseCookiesFor(client, requestedUseCookies, forceAll = false) {
+  return requestedUseCookies && HAS_COOKIES && (forceAll || COOKIE_CLIENTS.includes(String(client || "").toLowerCase()));
 }
 
 // ========= yt-dlp invocations (cookie→nocookie fallback per client) =========
@@ -281,7 +287,7 @@ function spawnYtDlpJSON(url, playerClient = "tv", useCookies = true) {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
-        const allowCookies = willUseCookiesFor(playerClient, useCookies);
+        const allowCookies = willUseCookiesFor(playerClient, useCookies, /*forceAll*/ false);
         const args = [
           "-J",
           "--no-warnings",
@@ -307,6 +313,8 @@ function spawnYtDlpJSON(url, playerClient = "tv", useCookies = true) {
           clearTimeout(timer);
           if (!out && code !== 0) {
             const em = `yt-dlp exit ${code} [client=${playerClient} cookies=${allowCookies}]: ${err.split("\n").slice(-6).join(" ")}`;
+            // EXTRA LOGGING for JSON failures
+            console.warn(`yt-dlp JSON fail [client=${playerClient} cookies=${allowCookies}] =>`, em);
             if (isAuthWallError(em) && allowCookies) {
               console.warn(`⚠️ AUTH wall (JSON) client=${playerClient} with cookies → retrying without cookies`);
               spawnYtDlpJSON(url, playerClient, false).then(resolve).catch(reject);
@@ -322,11 +330,11 @@ function spawnYtDlpJSON(url, playerClient = "tv", useCookies = true) {
   );
 }
 
-function spawnYtDlpBestUrl(url, playerClient = "tv", useCookies = true) {
+function spawnYtDlpBestUrl(url, playerClient = "tv", useCookies = true, forceAllCookies = false) {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
-        const allowCookies = willUseCookiesFor(playerClient, useCookies);
+        const allowCookies = willUseCookiesFor(playerClient, useCookies, forceAllCookies);
         const args = [
           "-g",
           "--no-warnings",
@@ -355,7 +363,7 @@ function spawnYtDlpBestUrl(url, playerClient = "tv", useCookies = true) {
             const em = `yt-dlp exit ${code} [client=${playerClient} cookies=${allowCookies}]: ${err.split("\n").slice(-6).join(" ")}`;
             if (isAuthWallError(em) && allowCookies) {
               console.warn(`⚠️ AUTH wall (-g) client=${playerClient} with cookies → retrying without cookies`);
-              spawnYtDlpBestUrl(url, playerClient, false).then(resolve).catch(reject);
+              spawnYtDlpBestUrl(url, playerClient, false, forceAllCookies).then(resolve).catch(reject);
               return;
             }
             const e = new Error(em);
@@ -374,11 +382,12 @@ function spawnYtDlpBestUrl(url, playerClient = "tv", useCookies = true) {
 async function spawnBestUrlAnyClient(url, opts = {}) {
   const clients = Array.isArray(opts.clients) && opts.clients.length ? opts.clients : YT_CLIENTS;
   const wantCookies = !opts.nocookie;
+  const forceAllCookies = !!opts.forceAllCookies;
   let authHit = false;
   let lastErr = null;
   for (const client of clients) {
     try {
-      const direct = await spawnYtDlpBestUrl(url, client, wantCookies);
+      const direct = await spawnYtDlpBestUrl(url, client, wantCookies, forceAllCookies);
       return { url: direct, client };
     } catch (e) {
       if (e && e.code === "AUTH_REQUIRED") authHit = true;
@@ -481,7 +490,8 @@ async function fetchInfoMergedFast(id, opts = {}) {
   } catch (e) {
     // All JSON failed → try -g across all clients
     try {
-      const { url: directUrl, client: gClient } = await spawnBestUrlAnyClient(url, { clients, nocookie: opts.nocookie });
+      const { url: directUrl, client: gClient } =
+        await spawnBestUrlAnyClient(url, { clients, nocookie: opts.nocookie });
       return {
         info: {
           id,
@@ -500,6 +510,28 @@ async function fetchInfoMergedFast(id, opts = {}) {
       };
     } catch (eg) {
       const authy = (e && e.code === "AUTH_REQUIRED") || (eg && eg.code === "AUTH_REQUIRED");
+      if (authy && COOKIE_ALL_ON_AUTH) {
+        // One more pass: force cookies for ALL clients
+        console.warn("⚠️ AUTH wall detected — retrying -g with cookies on all clients (COOKIE_ALL_ON_AUTH=1)");
+        const { url: directUrl, client: gClient } =
+          await spawnBestUrlAnyClient(url, { clients, nocookie: false, forceAllCookies: true });
+        return {
+          info: {
+            id,
+            formats: [
+              {
+                format_id: "best",
+                ext: directUrl.includes(".m3u8") ? "m3u8" : "mp4",
+                protocol: directUrl.includes(".m3u8") ? "m3u8" : "https",
+                vcodec: "unknown",
+                acodec: "unknown",
+                url: directUrl,
+              },
+            ],
+          },
+          client: `best-url:${gClient}+cookies-all`,
+        };
+      }
       if (authy) {
         const err = new Error("Auth required");
         err.code = "AUTH_REQUIRED";
@@ -551,7 +583,8 @@ app.get("/healthz", (_req, res) => {
     rssMB: Math.round(process.memoryUsage().rss / (1024 * 1024)),
     clients: YT_CLIENTS,
     cookieClients: COOKIE_CLIENTS,
-    forceNoCookies: FORCE_NO_COOKIES
+    forceNoCookies: FORCE_NO_COOKIES,
+    cookieAllOnAuth: COOKIE_ALL_ON_AUTH
   });
 });
 
