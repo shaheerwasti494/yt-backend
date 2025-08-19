@@ -300,7 +300,7 @@ function isAuthWallError(msg = "") {
          /account associated/i.test(s);
 }
 
-function spawnYtDlpJSON(url, playerClient = "android") {
+function spawnYtDlpJSON(url, playerClient = "android", useCookies = true) {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
@@ -313,12 +313,11 @@ function spawnYtDlpJSON(url, playerClient = "android") {
           "--retries", String(YTDLP_RETRIES),
         ];
         if (YTDLP_FORCE_IPV4) args.unshift("-4");
-        if (HAS_COOKIES) { args.push("--cookies", YT_COOKIES); }
+        if (useCookies && HAS_COOKIES) args.push("--cookies", YT_COOKIES);
         args.push(url);
 
         const child = track(spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] }));
-        let out = "";
-        let err = "";
+        let out = "", err = "";
         const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
         child.stdout.setEncoding("utf8");
@@ -330,20 +329,24 @@ function spawnYtDlpJSON(url, playerClient = "android") {
           clearTimeout(timer);
           if (!out && code !== 0) {
             const em = `yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`;
-            if (isAuthWallError(em)) {
-              const e = new Error(em);
-              e.code = "AUTH_REQUIRED";
-              return reject(e);
+            if (isAuthWallError(em) && useCookies && HAS_COOKIES) {
+              console.warn("⚠️ AUTH wall with cookies; retrying without cookies…");
+              // retry once WITHOUT cookies
+              spawnYtDlpJSON(url, playerClient, false).then(resolve).catch(reject);
+              return;
             }
-            return reject(new Error(em));
+            const e = new Error(em);
+            if (isAuthWallError(em)) e.code = "AUTH_REQUIRED";
+            return reject(e);
           }
-          try { resolve(JSON.parse(out)); } catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
+          try { resolve(JSON.parse(out)); }
+          catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
         });
       })
   );
 }
 
-function spawnYtDlpBestUrl(url, playerClient = "android") {
+function spawnYtDlpBestUrl(url, playerClient = "android", useCookies = true) {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
@@ -357,7 +360,7 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
           "-f", 'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
         ];
         if (YTDLP_FORCE_IPV4) args.unshift("-4");
-        if (HAS_COOKIES) args.push("--cookies", YT_COOKIES);
+        if (useCookies && HAS_COOKIES) args.push("--cookies", YT_COOKIES);
         args.push(url);
 
         const child = track(spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] }));
@@ -373,12 +376,14 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
           clearTimeout(timer);
           if (code !== 0) {
             const em = `yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`;
-            if (isAuthWallError(em)) {
-              const e = new Error(em);
-              e.code = "AUTH_REQUIRED";
-              return reject(e);
+            if (isAuthWallError(em) && useCookies && HAS_COOKIES) {
+              console.warn("⚠️ AUTH wall with cookies; retrying -g without cookies…");
+              spawnYtDlpBestUrl(url, playerClient, false).then(resolve).catch(reject);
+              return;
             }
-            return reject(new Error(em));
+            const e = new Error(em);
+            if (isAuthWallError(em)) e.code = "AUTH_REQUIRED";
+            return reject(e);
           }
           const direct = out.trim().split("\n").pop();
           if (!direct) return reject(new Error("No direct URL from yt-dlp -g"));
@@ -387,6 +392,7 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
       })
   );
 }
+
 
 // ========= Format assembly =========
 function buildFormats(info) {
