@@ -1,11 +1,11 @@
 "use strict";
 
 /**
- * PrimeTube yt-dlp microservice (optimized)
+ * PrimeTube yt-dlp microservice (optimized, cookie-ready)
  * - Parallel client probing (android/tv/web/ios) with tiny merge window
  * - In-flight request coalescing & short-lived format cache
  * - Backpressure & bounded yt-dlp concurrency
- * - Robust cookie handling (keeps google.com/accounts.google.com auth cookies)
+ * - Robust cookie handling (path / base64-gzip / base64) with domain filtering
  */
 
 const express = require("express");
@@ -19,7 +19,8 @@ const path = require("path");
 const zlib = require("zlib");
 
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
+// Cloud Run listens on 8080; keep fallback for local dev.
+const PORT = Number(process.env.PORT || 8080);
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
@@ -59,12 +60,12 @@ const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS
 const MAX_QUEUE = Number(process.env.MAX_QUEUE || 64);
 
 // ========= Cookies =========
-// You can supply cookies one of four ways (first one that exists is used):
-// 1) YT_COOKIES_PATH: absolute path to Netscape cookie file
-// 2) YT_COOKIES: path (legacy variable name)
-// 3) YT_COOKIES_B64_GZ: base64(gzip(cookie_file))
-// 4) YT_COOKIES_B64: base64(cookie_file)
-// You may set NO_COOKIE_FILTER=1 to skip domain filtering entirely.
+// Accepted inputs (first that exists is used):
+// 1) YT_COOKIES_PATH (preferred) - absolute path to Netscape cookie file
+// 2) YT_COOKIES (legacy path var)
+// 3) YT_COOKIES_B64_GZ          - base64(gzip(cookie_file))
+// 4) YT_COOKIES_B64             - base64(cookie_file)
+// Set NO_COOKIE_FILTER=1 to disable domain filtering (keeps file verbatim).
 let YT_COOKIES = process.env.YT_COOKIES_PATH || process.env.YT_COOKIES || "";
 const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
 const B64    = process.env.YT_COOKIES_B64     || "";
@@ -89,20 +90,19 @@ function filterDomains(text) {
       .join("\n") + "\n"
   );
 }
-
 function hasAny(str, names) {
   return names.some((n) => new RegExp(`\\t${n}\\t`, "i").test(str));
 }
 function validateCookieJar(str) {
   const okGoogle   = hasAny(str, ["SID","HSID","SSID","APISID","SAPISID","__Secure-3PAPISID"]);
   const okYouTube  = hasAny(str, ["CONSENT","YSC","PREF","VISITOR_INFO1_LIVE"]);
-  if (!okGoogle) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID/etc). Export from your daily browser profile while signed in.");
+  if (!okGoogle) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID/etc). Export from your primary browser profile while signed in.");
   if (!okYouTube) console.warn("⚠️ youtube.com cookies missing basic tokens (CONSENT/YSC/etc).");
 }
 
 try {
   if (!YT_COOKIES && (B64_GZ || B64)) {
-    const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
+    const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt"); // Cloud Run-friendly
     if (B64_GZ) {
       const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
       const text = zlib.gunzipSync(raw).toString("utf8");
@@ -120,9 +120,11 @@ try {
 }
 
 const HAS_COOKIES = Boolean(YT_COOKIES && fs.existsSync(YT_COOKIES));
+let COOKIE_BYTES = 0;
 if (HAS_COOKIES) {
   try {
     const stat = fs.statSync(YT_COOKIES);
+    COOKIE_BYTES = stat.size;
     console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES}`);
   } catch (e) {
     console.warn("⚠️ Cookies path set but unreadable:", e.message);
@@ -130,6 +132,11 @@ if (HAS_COOKIES) {
 } else {
   console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
+
+// Tiny introspection endpoint (no secrets leaked)
+app.get("/cookiez", (_req, res) => {
+  res.json({ hasCookies: HAS_COOKIES, bytes: COOKIE_BYTES, path: HAS_COOKIES ? YT_COOKIES : null });
+});
 
 // ========= Cache =========
 const cache = new NodeCache({
