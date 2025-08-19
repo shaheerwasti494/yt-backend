@@ -7,7 +7,8 @@
  * - Backpressure & bounded yt-dlp concurrency
  * - Robust cookie handling (path / base64-gzip / base64) with domain filtering
  * - Auth-aware error mapping (403 for anti-bot), cookie health introspection
- * - NEW: auth-wall fallback (retry without cookies if cookie’d attempt is challenged)
+ * - Auth-wall fallback: retry w/o cookies if cookie’d attempt is challenged
+ * - NEW: multi-client -g fallback (web/android/tv/ios), not just first client
  */
 
 const express = require("express");
@@ -21,13 +22,11 @@ const path = require("path");
 const zlib = require("zlib");
 
 const app = express();
-// Cloud Run listens on 8080; keep fallback for local dev.
 const PORT = Number(process.env.PORT || 8080);
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
-// Slightly higher threshold to avoid tiny-response compression overhead
 app.use(cors());
 app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: "256kb" }));
@@ -40,47 +39,35 @@ app.get("/robots.txt", (_req, res) => res.type("text/plain").send("User-agent: *
 const VCPUS = Number(process.env.CPU_LIMIT || os.cpus().length || 1);
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds (info JSON cache)
-const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds (redirect URL cache)
+const INFO_TTL = Number(process.env.INFO_TTL || 300);
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300);
 
-// Auto-size yt-dlp parallelism: ~2x vCPUs, within sane bounds
+// ~2x vCPUs, within bounds
 const MAX_YTDLP = Math.max(2, Math.min(Number(process.env.MAX_YTDLP || VCPUS * 2), 8));
 
-const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 18000); // kill hung yt-dlp quickly
+const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 18000);
 const YTDLP_SOCKET_TIMEOUT_SEC = Number(process.env.YTDLP_SOCKET_TIMEOUT_SEC || 12);
 const YTDLP_RETRIES = Number(process.env.YTDLP_RETRIES || 1);
-const YTDLP_FORCE_IPV4 = /^1|true$/i.test(String(process.env.YTDLP_FORCE_IPV4 || "1")); // often cleaner routes
+const YTDLP_FORCE_IPV4 = /^1|true$/i.test(String(process.env.YTDLP_FORCE_IPV4 || "1"));
 
-// Prefer android/tv first for quick HLS; still merge others opportunistically
 const YT_CLIENTS = (process.env.YT_CLIENTS || "android,tv,web,ios")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
-// Return first good immediately, but wait a tiny window to merge late arrivals
 const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS || 150);
-
-// Backpressure: fail fast when queue explodes so autoscaling can pick up
 const MAX_QUEUE = Number(process.env.MAX_QUEUE || 64);
 
 // ========= Cookies =========
-// Accepted inputs (first that exists is used):
-// 1) YT_COOKIES_PATH (preferred) - absolute path to Netscape cookie file (read-only secret OK; we copy to /tmp)
-// 2) YT_COOKIES (legacy path var)
-// 3) YT_COOKIES_B64_GZ          - base64(gzip(cookie_file))
-// 4) YT_COOKIES_B64             - base64(cookie_file)
-// Set NO_COOKIE_FILTER=1 to disable domain filtering (keeps file verbatim).
 let YT_COOKIES = process.env.YT_COOKIES_PATH || process.env.YT_COOKIES || "";
 const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
 const B64    = process.env.YT_COOKIES_B64     || "";
 const NO_COOKIE_FILTER = /^1|true$/i.test(String(process.env.NO_COOKIE_FILTER || ""));
 
-// Safe debug (lengths only)
 if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
-// Keep comments AND auth-critical Google domains (not just youtube/*)
 function filterDomains(text) {
   const keepers = [
-    /^#/, // comments + #HttpOnly_ etc
+    /^#/, // comments + #HttpOnly_
     /(^|\s)\.?(youtube|googlevideo|ytimg)\.com\s/i,
     /(^|\s)\.?(google|accounts\.google)\.com\s/i,
     /(^|\s)\.?(gstatic|youtube\-nocookie)\.com\s/i,
@@ -102,12 +89,10 @@ function cookieHealth(text) {
 }
 function validateCookieJar(str) {
   const health = cookieHealth(str);
-  if (!health.googleAuth) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID family). Export from your primary browser profile while signed in.");
+  if (!health.googleAuth) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID family). Export while signed-in.");
   if (!health.ytBasics)   console.warn("⚠️ youtube.com cookies missing basic tokens (CONSENT/YSC/etc).");
   return health;
 }
-
-// Always materialize a writable copy for yt-dlp (Cloud Run secrets are read-only)
 function writeTmpCookies(text) {
   const dest = path.join(os.tmpdir(), "youtube.cookies.txt");
   const finalText = NO_COOKIE_FILTER ? text : filterDomains(text);
@@ -154,7 +139,6 @@ if (HAS_COOKIES) {
   console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
 
-// Tiny introspection endpoint (no secrets leaked)
 app.get("/cookiez", (_req, res) => {
   res.json({
     hasCookies: HAS_COOKIES,
@@ -167,7 +151,7 @@ app.get("/cookiez", (_req, res) => {
 // ========= Cache =========
 const cache = new NodeCache({
   stdTTL: INFO_TTL,
-  checkperiod: Math.max(30, Math.min(INFO_TTL, 120)), // keep memory tidy
+  checkperiod: Math.max(30, Math.min(INFO_TTL, 120)),
   useClones: false
 });
 
@@ -213,8 +197,6 @@ function setShortPrivate(res, seconds = 60) {
     `private, max-age=${seconds}, stale-while-revalidate=${Math.ceil(seconds / 2)}`
   );
 }
-
-/** Parse 'expire' from googlevideo-style URLs for adaptive TTL. */
 function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {}) {
   try {
     const u = new URL(urlStr);
@@ -387,6 +369,28 @@ function spawnYtDlpBestUrl(url, playerClient = "android", useCookies = true) {
   );
 }
 
+// NEW: try -g across all configured clients (each with cookie→nocookie retry)
+async function spawnBestUrlAnyClient(url) {
+  let authHit = false;
+  let lastErr = null;
+  for (const client of YT_CLIENTS) {
+    try {
+      const direct = await spawnYtDlpBestUrl(url, client, /*useCookies*/ true);
+      return { url: direct, client };
+    } catch (e) {
+      if (e && e.code === "AUTH_REQUIRED") authHit = true;
+      lastErr = e;
+      continue;
+    }
+  }
+  if (authHit) {
+    const err = new Error("Auth required");
+    err.code = "AUTH_REQUIRED";
+    throw err;
+  }
+  throw lastErr || new Error("Failed to resolve best URL");
+}
+
 // ========= Format assembly =========
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
@@ -455,8 +459,7 @@ function pickBestMergedMp4(info, maxHeight) {
 // ========= In-flight de-dup =========
 const inflight = new Map(); // key: `stream_${id}` -> Promise<{result, client}>
 
-// ========= Fast parallel fetch & merge =========
-// ========= Fast parallel fetch & merge (now with AUTH-safe -g fallback) =========
+// ========= Fast parallel fetch & merge (AUTH-safe with multi-client -g fallback) =========
 async function fetchInfoMergedFast(id) {
   const url = `https://www.youtube.com/watch?v=${id}`;
 
@@ -472,43 +475,39 @@ async function fetchInfoMergedFast(id) {
 
   let first;
   try {
-    // First client that returns usable JSON wins fast-path
     first = await Promise.any(all);
   } catch (e) {
-    // NEW: regardless of why JSON failed (including AUTH_REQUIRED),
-    // attempt last-resort direct URL via -g (which already retries w/o cookies).
+    // All JSON failed (incl. AUTH): try -g across *all* clients
     try {
-      const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
+      const { url: directUrl, client: gClient } = await spawnBestUrlAnyClient(url);
       return {
         info: {
           id,
           formats: [
             {
               format_id: "best",
-              ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
-              protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
+              ext: directUrl.includes(".m3u8") ? "m3u8" : "mp4",
+              protocol: directUrl.includes(".m3u8") ? "m3u8" : "https",
               vcodec: "unknown",
               acodec: "unknown",
-              url: bestUrl,
+              url: directUrl,
             },
           ],
         },
-        client: "best-url",
+        client: `best-url:${gClient}`,
       };
     } catch (eg) {
-      // If either the JSON batch or the -g fallback was AUTH-gated, surface AUTH_REQUIRED.
       const authy = (e && e.code === "AUTH_REQUIRED") || (eg && eg.code === "AUTH_REQUIRED");
       if (authy) {
         const err = new Error("Auth required");
         err.code = "AUTH_REQUIRED";
         throw err;
       }
-      // otherwise, throw the -g error (more actionable)
       throw eg;
     }
   }
 
-  // Optionally wait a small window to merge late JSON successes
+  // Merge small window of late successes
   const gather = Promise.allSettled(all);
   const timed = await Promise.race([
     gather,
@@ -551,7 +550,6 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
-// Prewarm cache for an ID (use from app when queuing next video)
 app.post("/prewarm", async (req, res) => {
   try {
     if (rejectIfBusy(res)) return;
@@ -578,7 +576,6 @@ app.post("/prewarm", async (req, res) => {
   }
 });
 
-// Formats JSON (short private cache). Uses fast-first + tiny merge window.
 app.get("/stream", async (req, res) => {
   try {
     if (rejectIfBusy(res)) return;
@@ -589,16 +586,15 @@ app.get("/stream", async (req, res) => {
     const hit = cache.get(cacheKey);
     if (hit) {
       res.set("X-PT-Cache", "HIT");
-      setShortPrivate(res, 60); // switch to setCacheHeaders(...,"public") if you front with CDN
+      setShortPrivate(res, 60);
       return res.json(hit);
     }
 
-    // In-flight coalescing
     if (!inflight.has(cacheKey)) {
       inflight.set(cacheKey, (async () => {
         const { info, client } = await fetchInfoMergedFast(id);
         const result = buildFormats(info);
-        cache.set(cacheKey, result, 60); // brief; URLs enforce their own expiry anyway
+        cache.set(cacheKey, result, 60);
         return { result, client };
       })().finally(() => {
         setTimeout(() => inflight.delete(cacheKey), 0);
@@ -623,7 +619,6 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// Redirect to a merged MP4 close to 480p (uses URL expiry for TTL)
 app.get("/stream480", async (req, res) => {
   try {
     if (rejectIfBusy(res)) return;
@@ -648,11 +643,12 @@ app.get("/stream480", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
-    const ttl = computeUrlTtlSec(url);
-    cache.set(cacheKey, url, ttl);
+    // Fallback: -g across all clients
+    const { url: directUrl } = await spawnBestUrlAnyClient(`https://www.youtube.com/watch?v=${id}`);
+    const ttl = computeUrlTtlSec(directUrl);
+    cache.set(cacheKey, directUrl, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(url);
+    return res.redirect(directUrl);
   } catch (e) {
     if (e?.code === "AUTH_REQUIRED") {
       res.set("X-PT-Auth", "MISSING");
@@ -663,7 +659,6 @@ app.get("/stream480", async (req, res) => {
   }
 });
 
-// Redirect to best merged MP4 under ?max= (uses URL expiry for TTL)
 app.get("/streamMp4", async (req, res) => {
   try {
     if (rejectIfBusy(res)) return;
@@ -689,11 +684,12 @@ app.get("/streamMp4", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
-    const ttl = computeUrlTtlSec(url);
-    cache.set(cacheKey, url, ttl);
+    // Fallback: -g across all clients
+    const { url: directUrl } = await spawnBestUrlAnyClient(`https://www.youtube.com/watch?v=${id}`);
+    const ttl = computeUrlTtlSec(directUrl);
+    cache.set(cacheKey, directUrl, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(url);
+    return res.redirect(directUrl);
   } catch (e) {
     if (e?.code === "AUTH_REQUIRED") {
       res.set("X-PT-Auth", "MISSING");
@@ -704,7 +700,6 @@ app.get("/streamMp4", async (req, res) => {
   }
 });
 
-// Filter playable shorts (HLS-aware)
 app.post("/filterPlayable", async (req, res) => {
   try {
     if (rejectIfBusy(res)) return;
@@ -721,8 +716,7 @@ app.post("/filterPlayable", async (req, res) => {
           const { info } = await fetchInfoMergedFast(id);
           const fmts = Array.isArray(info?.formats) ? info.formats : [];
           const hasHls = fmts.some((f) => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
-          if (hasHls) return id; // HLS masters are self-contained for Exo
-
+          if (hasHls) return id; // HLS masters are self-contained
           const hasVideo = fmts.some((f) => f?.vcodec && f.vcodec !== "none" && pickUrl(f));
           const hasAudio = fmts.some((f) => f?.acodec && f.acodec !== "none" && pickUrl(f));
           return hasVideo && hasAudio ? id : null;
