@@ -1,5 +1,19 @@
 "use strict";
 
+/**
+ * PrimeTube yt-dlp microservice (cookie-savvy, auth-wall resilient)
+ * - Parallel client probing (tv/android/ios/web) + tiny merge window
+ * - In-flight request coalescing & short-lived caches
+ * - Backpressure & bounded yt-dlp concurrency
+ * - Cookie handling (path / base64-gzip / base64) with optional domain filtering
+ * - Auth-aware error mapping (403) + health introspection
+ * - Fallback chain: JSON (cookie→nocookie) → multi-client -g (cookie→nocookie)
+ * - NEW:
+ *    • Default client order prefers TV/Android
+ *    • COOKIE_CLIENTS (e.g. "web" default) to avoid cookie use on TV/Android
+ *    • FORCE_NO_COOKIES=1 or per-request ?nocookie=1
+ */
+
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
@@ -11,159 +25,154 @@ const path = require("path");
 const zlib = require("zlib");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 8080);
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 app.use(cors());
-app.use(compression());
+app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: "256kb" }));
 
-// ---- Root/health ----------------------------------------------------------------
+// ---- Root/health/robots ----
 app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/robots.txt", (_req, res) => res.type("text/plain").send("User-agent: *\nDisallow:\n"));
 
-// ---------- Config ---------------------------------------------------------------
+// ========= Config =========
+const VCPUS = Number(process.env.CPU_LIMIT || os.cpus().length || 1);
+
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TTL = Number(process.env.INFO_TTL || 300);        // seconds (info cache)
-const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300); // seconds (URL cache)
-const MAX_YTDLP = Number(process.env.MAX_YTDLP || 4);
-const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
+const INFO_TTL = Number(process.env.INFO_TTL || 300);
+const URL_TTL_FALLBACK = Number(process.env.URL_TTL || 300);
 
-// Prefer android/tv for quick-start HLS; still merge others opportunistically
-const YT_CLIENTS = (process.env.YT_CLIENTS || "android,tv,web,ios")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const MAX_YTDLP = Math.max(2, Math.min(Number(process.env.MAX_YTDLP || VCPUS * 2), 8));
 
-// Return the first good client immediately, but wait this long (ms) to merge late arrivals (optional)
-const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS || 250);
+const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 18000);
+const YTDLP_SOCKET_TIMEOUT_SEC = Number(process.env.YTDLP_SOCKET_TIMEOUT_SEC || 12);
+const YTDLP_RETRIES = Number(process.env.YTDLP_RETRIES || 1);
+const YTDLP_FORCE_IPV4 = /^1|true$/i.test(String(process.env.YTDLP_FORCE_IPV4 || "1"));
 
-// ---------- Cookies: best-practice materialization -------------------------------
+// Prefer TV/Android first (lower chance of web anti-bot)
+const YT_CLIENTS = (process.env.YT_CLIENTS || "tv,android,ios,web")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
-/**
- * We support three ways to supply cookies:
- * 1) YT_COOKIES -> path to Netscape cookie file (best)
- * 2) YT_COOKIES_B64_GZ -> base64(gzip(cookie.txt))
- * 3) YT_COOKIES_B64    -> base64(cookie.txt)
- *
- * We do NOT filter domains (keeps *.google.com + accounts.google.com needed for SAPISIDHASH).
- */
+// Only these clients will use cookies (default: web only)
+const COOKIE_CLIENTS = (process.env.COOKIE_CLIENTS || "web")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
-let YT_COOKIES_PATH = process.env.YT_COOKIES || ""; // If set to a readable file, we use it verbatim.
+// Force disabling cookies globally (e.g. to test)
+const FORCE_NO_COOKIES = /^1|true$/i.test(String(process.env.FORCE_NO_COOKIES || ""));
+
+// Small merge window
+const FIRST_GOOD_MERGE_WINDOW_MS = Number(process.env.FIRST_GOOD_MERGE_WINDOW_MS || 150);
+
+// Backpressure
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 64);
+
+// ========= Cookies =========
+let YT_COOKIES = process.env.YT_COOKIES_PATH || process.env.YT_COOKIES || "";
 const B64_GZ = process.env.YT_COOKIES_B64_GZ || "";
 const B64    = process.env.YT_COOKIES_B64     || "";
+const NO_COOKIE_FILTER = /^1|true$/i.test(String(process.env.NO_COOKIE_FILTER || ""));
 
 // Safe debug (lengths only)
 if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
-// ---- Consent helpers (avoid EU consent gate on europe-west1 etc.) ---------------
-const FAR_FUTURE = 2145916800; // Jan 1, 2038
-
-/** Ensure EU consent cookies exist for google/youtube. */
-function ensureConsentCookies(text) {
-  const needConsent = !/\tCONSENT\t/.test(text);
-  const needSocs    = !/\tSOCS\t/.test(text);
-  if (!needConsent && !needSocs) return text;
-
-  const bases = [".youtube.com", ".google.com"];
-  const lines = [text.trimEnd()];
-  if (needConsent) {
-    for (const d of bases) lines.push(`${d}\tTRUE\t/\tTRUE\t${FAR_FUTURE}\tCONSENT\tYES+`);
-  }
-  if (needSocs) {
-    // Minimal SOCS value to suppress consent interstitial
-    for (const d of bases) lines.push(`${d}\tTRUE\t/\tTRUE\t${FAR_FUTURE}\tSOCS\tCAI`);
-  }
-  return lines.join("\n") + "\n";
-}
-
-/** Pretty log which key cookies we actually have. */
-function logCookieSanity(txt) {
-  const want = [
-    "SID","__Secure-1PSID","__Secure-3PSID",
-    "HSID","SSID","APISID","SAPISID",
-    "__Secure-1PAPISID","__Secure-3PAPISID",
-    "CONSENT","SOCS","VISITOR_INFO1_LIVE"
+function filterDomains(text) {
+  const keepers = [
+    /^#/, // comments + #HttpOnly_
+    /(^|\s)\.?(youtube|googlevideo|ytimg)\.com\s/i,
+    /(^|\s)\.?(google|accounts\.google)\.com\s/i,
+    /(^|\s)\.?(gstatic|youtube\-nocookie)\.com\s/i,
   ];
-  const present = want.filter(n => txt.includes(`\t${n}\t`));
-  console.log("🔎 Cookie sanity:", present.length ? present.join(", ") : "(none)");
-  if (!present.includes("CONSENT") || !present.includes("SOCS")) {
-    console.log("ℹ️  No CONSENT/SOCS found; adding generic consent to avoid EU interstitial.");
-  }
+  return (
+    text
+      .split(/\r?\n/)
+      .filter((l) => l.trim() === "" || keepers.some((re) => re.test(l)))
+      .join("\n") + "\n"
+  );
+}
+function hasAny(str, names) {
+  return names.some((n) => new RegExp(`\\t${n}\\t`, "i").test(str));
+}
+function cookieHealth(text) {
+  const googleAuth = hasAny(text, ["SID","HSID","SSID","APISID","SAPISID","__Secure-3PAPISID","__Secure-1PSID","__Secure-3PSID"]);
+  const ytBasics   = hasAny(text, ["CONSENT","YSC","PREF","VISITOR_INFO1_LIVE"]);
+  return { googleAuth, ytBasics };
+}
+function validateCookieJar(str) {
+  const health = cookieHealth(str);
+  if (!health.googleAuth) console.warn("⚠️ google.com auth cookies missing (SID/SAPISID family). Export while signed-in.");
+  if (!health.ytBasics)   console.warn("⚠️ youtube.com cookies missing basic tokens (CONSENT/YSC/etc).");
+  return health;
+}
+function writeTmpCookies(text) {
+  const dest = path.join(os.tmpdir(), "youtube.cookies.txt");
+  const finalText = NO_COOKIE_FILTER ? text : filterDomains(text);
+  fs.writeFileSync(dest, finalText, "utf8");
+  try { fs.chmodSync(dest, 0o600); } catch {}
+  console.log(`🔁 Cookies materialized to ${dest} (${finalText.length} bytes)`);
+  return dest;
 }
 
-function decodeB64(s) {
-  try { return Buffer.from(String(s).replace(/\s+/g, ""), "base64").toString("utf8"); }
-  catch { return ""; }
-}
-function decodeB64Gz(s) {
-  try { return zlib.gunzipSync(Buffer.from(String(s).replace(/\s+/g, ""), "base64")).toString("utf8"); }
-  catch { return ""; }
-}
-function cookieScore(txt) {
-  // reward presence of auth/consent cookies vital for YouTube internal API calls
-  const names = [
-    "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID",
-    "APISID", "SID", "HSID", "SSID", "CONSENT", "SOCS"
-  ];
-  const hits = names.reduce((n, k) => n + (txt.includes(`\t${k}\t`) ? 1 : 0), 0);
-  return hits * 100000 + txt.length; // hits first, then size
-}
-function writeTempCookies(text) {
-  // Add consent if missing (important for EU regions)
-  text = ensureConsentCookies(text);
-  const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
-  fs.writeFileSync(tmpFile, text, "utf8"); // NO FILTERING
-  return tmpFile;
-}
+let COOKIE_HEALTH = { googleAuth: false, ytBasics: false };
 
-// Materialize cookies if no file path provided but B64 data exists
 try {
-  const pathLooksGood = YT_COOKIES_PATH && fs.existsSync(YT_COOKIES_PATH) && fs.statSync(YT_COOKIES_PATH).isFile();
-  if (!pathLooksGood && (B64_GZ || B64)) {
-    const candidates = [];
-    if (B64_GZ) candidates.push(decodeB64Gz(B64_GZ));
-    if (B64)    candidates.push(decodeB64(B64));
-    const valid = candidates.filter(Boolean);
-    if (!valid.length) throw new Error("No decodable cookie payloads found");
-
-    // pick best by cookieScore
-    const best = valid.sort((a, b) => cookieScore(b) - cookieScore(a))[0];
-    YT_COOKIES_PATH = writeTempCookies(best);
+  if (!YT_COOKIES && (B64_GZ || B64)) {
+    if (B64_GZ) {
+      const raw = Buffer.from(String(B64_GZ).replace(/\s+/g, ""), "base64");
+      const text = zlib.gunzipSync(raw).toString("utf8");
+      COOKIE_HEALTH = validateCookieJar(text);
+      YT_COOKIES = writeTmpCookies(text);
+    } else if (B64) {
+      const text = Buffer.from(String(B64).replace(/\s+/g, ""), "base64").toString("utf8");
+      COOKIE_HEALTH = validateCookieJar(text);
+      YT_COOKIES = writeTmpCookies(text);
+    }
+  } else if (YT_COOKIES && fs.existsSync(YT_COOKIES)) {
+    const srcText = fs.readFileSync(YT_COOKIES, "utf8");
+    COOKIE_HEALTH = validateCookieJar(srcText);
+    YT_COOKIES = writeTmpCookies(srcText);
   }
 } catch (e) {
   console.error("❌ Failed to materialize cookies:", e.message);
 }
 
-// Sanity log + size (and add consent even when using a mounted file)
-let HAS_COOKIES = false;
-if (YT_COOKIES_PATH) {
+const HAS_COOKIES = Boolean(YT_COOKIES && fs.existsSync(YT_COOKIES) && !FORCE_NO_COOKIES);
+let COOKIE_BYTES = 0;
+if (HAS_COOKIES) {
   try {
-    const stat = fs.statSync(YT_COOKIES_PATH);
-    let txt = fs.readFileSync(YT_COOKIES_PATH, "utf8");
-
-    const withConsent = ensureConsentCookies(txt);
-    if (withConsent !== txt) {
-      // don't mutate the original secret/file; write an effective copy
-      YT_COOKIES_PATH = writeTempCookies(withConsent);
-      console.log("🔧 Added generic consent cookies; using temp cookie file.");
-      txt = withConsent;
-    }
-
-    console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES_PATH}`);
-    logCookieSanity(txt);
-    HAS_COOKIES = true;
+    const stat = fs.statSync(YT_COOKIES);
+    COOKIE_BYTES = stat.size;
+    console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES}`);
   } catch (e) {
     console.warn("⚠️ Cookies path set but unreadable:", e.message);
   }
-}
-if (!HAS_COOKIES) {
-  console.warn("⚠️ No cookies available. Age/region/anti-bot checks may fail.");
+} else {
+  if (FORCE_NO_COOKIES) console.warn("ℹ️ FORCE_NO_COOKIES=1 — cookies disabled.");
+  else console.warn("⚠️ No cookies found. Age/region/anti-bot checks may fail.");
 }
 
-// ---------- Caches ----------------------------------------------------------------
-const cache = new NodeCache({ stdTTL: INFO_TTL, useClones: false });
+app.get("/cookiez", (_req, res) => {
+  res.json({
+    hasCookies: HAS_COOKIES,
+    bytes: COOKIE_BYTES,
+    path: HAS_COOKIES ? YT_COOKIES : null,
+    checks: COOKIE_HEALTH,
+    cookieClients: COOKIE_CLIENTS,
+    forceNoCookies: FORCE_NO_COOKIES
+  });
+});
 
-// ---------- Concurrency (semaphore) -----------------------------------------------
+// ========= Cache =========
+const cache = new NodeCache({
+  stdTTL: INFO_TTL,
+  checkperiod: Math.max(30, Math.min(INFO_TTL, 120)),
+  useClones: false
+});
+
+// ========= Concurrency (semaphore) =========
 let running = 0;
 const queue = [];
 function schedule(fn) {
@@ -190,17 +199,18 @@ function tick() {
   }
 }
 
-// ---------- Helpers ----------------------------------------------------------------
+// ========= Helpers =========
 const YT_ID = /^[\w-]{11}$/;
 
 function setCacheHeaders(res, seconds, extra = "public") {
-  res.set("Cache-Control", `${extra}, max-age=${seconds}, s-maxage=${seconds}`);
+  res.set(
+    "Cache-Control",
+    `${extra}, max-age=${seconds}, s-maxage=${seconds}, stale-while-revalidate=${Math.ceil(seconds / 2)}`
+  );
 }
 function setShortPrivate(res, seconds = 60) {
-  res.set("Cache-Control", `private, max-age=${seconds}`);
+  res.set("Cache-Control", `private, max-age=${seconds}, stale-while-revalidate=${Math.ceil(seconds / 2)}`);
 }
-
-/** Parse 'expire' from googlevideo-style URLs for adaptive TTL. */
 function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {}) {
   try {
     const u = new URL(urlStr);
@@ -213,34 +223,19 @@ function computeUrlTtlSec(urlStr, { floor = 30, ceil = 3600, safety = 30 } = {})
   } catch (_e) {}
   return URL_TTL_FALLBACK;
 }
-
 const pickUrl = (f) =>
-  f?.url ||
-  f?.manifest_url ||
-  f?.hls_manifest_url ||
-  f?.dash_manifest_url ||
-  f?.fragment_base_url ||
-  null;
-
+  f?.url || f?.manifest_url || f?.hls_manifest_url || f?.dash_manifest_url || f?.fragment_base_url || null;
 const looksLikeHls = (url, proto, ext) =>
   (typeof proto === "string" && proto.includes("m3u8")) ||
   (typeof ext === "string" && ext.includes("m3u8")) ||
   (typeof url === "string" && url.includes(".m3u8"));
-
-const isStoryboard = (f) =>
-  f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
-
-/** Heuristic to pick the “best” info (bigger max height + more adaptive tracks). */
+const isStoryboard = (f) => f?.protocol === "mhtml" || /^sb\d/.test(String(f?.format_id || ""));
 function scoreInfo(info) {
   const fmts = Array.isArray(info?.formats) ? info.formats : [];
   const maxH = fmts.reduce((m, f) => Math.max(m, Number(f?.height) || 0), 0);
-  const adaptiveCount = fmts.filter(
-    (f) => (f?.vcodec && f.vcodec !== "none") && (!f?.acodec || f.acodec === "none")
-  ).length;
+  const adaptiveCount = fmts.filter((f) => (f?.vcodec && f.vcodec !== "none") && (!f?.acodec || f.acodec === "none")).length;
   return maxH * 1000 + adaptiveCount;
 }
-
-/** Merge multiple infos’ formats into a superset (dedup roughly). */
 function mergeInfos(infos) {
   if (!infos.length) return { formats: [] };
   const out = { ...infos[0], formats: [] };
@@ -263,61 +258,43 @@ function mergeInfos(infos) {
   }
   return out;
 }
+const children = new Set();
+function track(child) {
+  try { children.add(child.pid); } catch {}
+  child.on("close", () => { try { children.delete(child.pid); } catch {} });
+  return child;
+}
 
-/** yt-dlp JSON */
-function spawnYtDlpJSON(url, playerClient = "android") {
+// ========= Error helpers =========
+function isAuthWallError(msg = "") {
+  const s = String(msg);
+  return /Sign in to confirm you.?re not a bot/i.test(s)
+      || /This video may be inappropriate/i.test(s)
+      || /account associated/i.test(s);
+}
+function willUseCookiesFor(client, requestedUseCookies) {
+  return requestedUseCookies && HAS_COOKIES && COOKIE_CLIENTS.includes(String(client || "").toLowerCase());
+}
+
+// ========= yt-dlp invocations (cookie→nocookie fallback per client) =========
+function spawnYtDlpJSON(url, playerClient = "tv", useCookies = true) {
   return schedule(
     () =>
       new Promise((resolve, reject) => {
+        const allowCookies = willUseCookiesFor(playerClient, useCookies);
         const args = [
           "-J",
           "--no-warnings",
           "--no-progress",
-          "--extractor-args",
-          `youtube:player_client=${playerClient}`,
+          "--extractor-args", `youtube:player_client=${playerClient}`,
+          "--socket-timeout", String(YTDLP_SOCKET_TIMEOUT_SEC),
+          "--retries", String(YTDLP_RETRIES),
         ];
-        if (HAS_COOKIES) {
-          args.push("--cookies", YT_COOKIES_PATH);
-        }
+        if (YTDLP_FORCE_IPV4) args.unshift("-4");
+        if (allowCookies) args.push("--cookies", YT_COOKIES);
         args.push(url);
 
-        const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
-        let out = "";
-        let err = "";
-        const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
-
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", (c) => (out += c));
-        child.stderr.on("data", (c) => (err += c));
-
-        child.on("error", (e) => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          if (!out && code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
-          try { resolve(JSON.parse(out)); } catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
-        });
-      })
-  );
-}
-
-/** Single best URL fallback */
-function spawnYtDlpBestUrl(url, playerClient = "android") {
-  return schedule(
-    () =>
-      new Promise((resolve, reject) => {
-        const args = [
-          "-g",
-          "--no-warnings",
-          "--no-progress",
-          "--extractor-args",
-          `youtube:player_client=${playerClient}`,
-          "-f",
-          'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
-        ];
-        if (HAS_COOKIES) args.push("--cookies", YT_COOKIES_PATH);
-        args.push(url);
-
-        const child = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+        const child = track(spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] }));
         let out = "", err = "";
         const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
 
@@ -328,7 +305,63 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
         child.on("error", (e) => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
         child.on("close", (code) => {
           clearTimeout(timer);
-          if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.split("\n").slice(-6).join(" ")}`));
+          if (!out && code !== 0) {
+            const em = `yt-dlp exit ${code} [client=${playerClient} cookies=${allowCookies}]: ${err.split("\n").slice(-6).join(" ")}`;
+            if (isAuthWallError(em) && allowCookies) {
+              console.warn(`⚠️ AUTH wall (JSON) client=${playerClient} with cookies → retrying without cookies`);
+              spawnYtDlpJSON(url, playerClient, false).then(resolve).catch(reject);
+              return;
+            }
+            const e = new Error(em);
+            if (isAuthWallError(em)) e.code = "AUTH_REQUIRED";
+            return reject(e);
+          }
+          try { resolve(JSON.parse(out)); } catch (e) { reject(new Error(`Invalid JSON from yt-dlp: ${e.message}`)); }
+        });
+      })
+  );
+}
+
+function spawnYtDlpBestUrl(url, playerClient = "tv", useCookies = true) {
+  return schedule(
+    () =>
+      new Promise((resolve, reject) => {
+        const allowCookies = willUseCookiesFor(playerClient, useCookies);
+        const args = [
+          "-g",
+          "--no-warnings",
+          "--no-progress",
+          "--extractor-args", `youtube:player_client=${playerClient}`,
+          "--socket-timeout", String(YTDLP_SOCKET_TIMEOUT_SEC),
+          "--retries", String(YTDLP_RETRIES),
+          "-f", 'best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
+        ];
+        if (YTDLP_FORCE_IPV4) args.unshift("-4");
+        if (allowCookies) args.push("--cookies", YT_COOKIES);
+        args.push(url);
+
+        const child = track(spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] }));
+        let out = "", err = "";
+        const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, YTDLP_TIMEOUT_MS);
+
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (c) => (out += c));
+        child.stderr.on("data", (c) => (err += c));
+
+        child.on("error", (e) => { clearTimeout(timer); reject(new Error(`yt-dlp spawn error: ${e.message}`)); });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          if (code !== 0) {
+            const em = `yt-dlp exit ${code} [client=${playerClient} cookies=${allowCookies}]: ${err.split("\n").slice(-6).join(" ")}`;
+            if (isAuthWallError(em) && allowCookies) {
+              console.warn(`⚠️ AUTH wall (-g) client=${playerClient} with cookies → retrying without cookies`);
+              spawnYtDlpBestUrl(url, playerClient, false).then(resolve).catch(reject);
+              return;
+            }
+            const e = new Error(em);
+            if (isAuthWallError(em)) e.code = "AUTH_REQUIRED";
+            return reject(e);
+          }
           const direct = out.trim().split("\n").pop();
           if (!direct) return reject(new Error("No direct URL from yt-dlp -g"));
           resolve(direct);
@@ -337,7 +370,31 @@ function spawnYtDlpBestUrl(url, playerClient = "android") {
   );
 }
 
-/** Build normalized ladder */
+// Try -g across all clients (each with cookie→nocookie)
+async function spawnBestUrlAnyClient(url, opts = {}) {
+  const clients = Array.isArray(opts.clients) && opts.clients.length ? opts.clients : YT_CLIENTS;
+  const wantCookies = !opts.nocookie;
+  let authHit = false;
+  let lastErr = null;
+  for (const client of clients) {
+    try {
+      const direct = await spawnYtDlpBestUrl(url, client, wantCookies);
+      return { url: direct, client };
+    } catch (e) {
+      if (e && e.code === "AUTH_REQUIRED") authHit = true;
+      lastErr = e;
+      continue;
+    }
+  }
+  if (authHit) {
+    const err = new Error("Auth required");
+    err.code = "AUTH_REQUIRED";
+    throw err;
+  }
+  throw lastErr || new Error("Failed to resolve best URL");
+}
+
+// ========= Format assembly =========
 function buildFormats(info) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
 
@@ -365,7 +422,6 @@ function buildFormats(info) {
       };
     })
     .filter((fmt) => fmt.url)
-    // keep both progressive and HLS at each height
     .filter((fmt, i, arr) => arr.findIndex(
       (x) => x.resolution === fmt.resolution && x.protocol === fmt.protocol
     ) === i)
@@ -389,31 +445,28 @@ function buildFormats(info) {
 
   return { videoFormats, audioFormats };
 }
-
-/** Best merged MP4 under limit */
 function pickBestMergedMp4(info, maxHeight) {
   const formats = Array.isArray(info?.formats) ? info.formats : [];
   const merged = formats.filter(
     (f) => f?.ext === "mp4" && pickUrl(f) && f?.vcodec && f.vcodec !== "none" && f?.acodec && f.acodec !== "none" && f?.height
   );
   if (!merged.length) return null;
-
   const below = merged.filter((f) => f.height <= maxHeight).sort((a, b) => b.height - a.height)[0];
   if (below) return below;
-
   return merged.filter((f) => f.height > maxHeight).sort((a, b) => a.height - b.height)[0] || null;
 }
 
-// ---------- In-flight de-dup (coalesce) -------------------------------------------
-const inflight = new Map(); // key: `stream_${id}` -> Promise<{videoFormats,audioFormats}>
+// ========= In-flight de-dup =========
+const inflight = new Map(); // key: `stream_${id}` -> Promise<{result, client}>
 
-// ---------- Fast parallel fetch & merge -------------------------------------------
-async function fetchInfoMergedFast(id) {
+// ========= Fast parallel fetch & merge (with multi-client -g fallback) =========
+async function fetchInfoMergedFast(id, opts = {}) {
   const url = `https://www.youtube.com/watch?v=${id}`;
+  const clients = Array.isArray(opts.clients) && opts.clients.length ? opts.clients : YT_CLIENTS;
+  const wantCookies = !opts.nocookie;
 
-  // Start all clients in parallel
-  const all = YT_CLIENTS.map((client) =>
-    spawnYtDlpJSON(url, client)
+  const all = clients.map((client) =>
+    spawnYtDlpJSON(url, client, wantCookies)
       .then((info) => {
         const fmts = Array.isArray(info?.formats) ? info.formats : [];
         const usable = fmts.some((f) => pickUrl(f));
@@ -422,32 +475,41 @@ async function fetchInfoMergedFast(id) {
       })
   );
 
-  // First good client
   let first;
   try {
     first = await Promise.any(all);
-  } catch {
-    // none succeeded; last resort: best url from first client name
-    const bestUrl = await spawnYtDlpBestUrl(url, YT_CLIENTS[0]);
-    return {
-      info: {
-        id,
-        formats: [
-          {
-            format_id: "best",
-            ext: bestUrl.includes(".m3u8") ? "m3u8" : "mp4",
-            protocol: bestUrl.includes(".m3u8") ? "m3u8" : "https",
-            vcodec: "unknown",
-            acodec: "unknown",
-            url: bestUrl,
-          },
-        ],
-      },
-      client: "best-url",
-    };
+  } catch (e) {
+    // All JSON failed → try -g across all clients
+    try {
+      const { url: directUrl, client: gClient } = await spawnBestUrlAnyClient(url, { clients, nocookie: opts.nocookie });
+      return {
+        info: {
+          id,
+          formats: [
+            {
+              format_id: "best",
+              ext: directUrl.includes(".m3u8") ? "m3u8" : "mp4",
+              protocol: directUrl.includes(".m3u8") ? "m3u8" : "https",
+              vcodec: "unknown",
+              acodec: "unknown",
+              url: directUrl,
+            },
+          ],
+        },
+        client: `best-url:${gClient}`,
+      };
+    } catch (eg) {
+      const authy = (e && e.code === "AUTH_REQUIRED") || (eg && eg.code === "AUTH_REQUIRED");
+      if (authy) {
+        const err = new Error("Auth required");
+        err.code = "AUTH_REQUIRED";
+        throw err;
+      }
+      throw eg;
+    }
   }
 
-  // Optionally wait a short window to gather more results to merge
+  // Merge a small window of late successes
   const gather = Promise.allSettled(all);
   const timed = await Promise.race([
     gather,
@@ -455,53 +517,81 @@ async function fetchInfoMergedFast(id) {
   ]);
 
   if (timed === "timeout") {
-    // Just return first (fast path)
     return { info: first.info, client: first.client };
   }
 
-  // Merge everything that succeeded
   const successes = /** @type {Array<{value?: any, status: string}>} */ (timed)
     .filter((s) => s.status === "fulfilled")
     .map((s) => s.value);
 
   const merged = mergeInfos(successes.map((t) => t.info));
-  // Pick best client label for logging
   const best = successes.sort((a, b) => b.score - a.score)[0];
   return { info: merged, client: best?.client || first.client };
 }
 
-// ---------- Routes ----------------------------------------------------------------
+// ========= Backpressure helper =========
+function rejectIfBusy(res) {
+  if (queue.length > MAX_QUEUE) {
+    res.set("Retry-After", "3");
+    res.status(503).json({ error: "Busy, please retry" });
+    return true;
+  }
+  return false;
+}
 
+// ========= Routes =========
 app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, running, queued: queue.length, cacheKeys: cache.keys().length });
+  res.json({
+    ok: true,
+    running,
+    queued: queue.length,
+    maxYtDlp: MAX_YTDLP,
+    cacheKeys: cache.keys().length,
+    uptimeSec: Math.floor(process.uptime()),
+    rssMB: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+    clients: YT_CLIENTS,
+    cookieClients: COOKIE_CLIENTS,
+    forceNoCookies: FORCE_NO_COOKIES
+  });
 });
 
-// Prewarm cache for an ID (use from app when queuing next video)
+// Prewarm cache
 app.post("/prewarm", async (req, res) => {
   try {
-    const id = String(req.body?.id || "");
-    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (rejectIfBusy(res)) return;
+    const id = String(req.body?.id || "").trim();
+    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
     const cacheKey = `stream_${id}`;
     if (!cache.get(cacheKey)) {
-      const { info } = await fetchInfoMergedFast(id);
+      const { info } = await fetchInfoMergedFast(id, { nocookie: !!req.query.nocookie });
       cache.set(cacheKey, buildFormats(info), 60);
     }
     setShortPrivate(res, 15);
     res.json({ ok: true });
   } catch (e) {
+    if (e?.code === "AUTH_REQUIRED") {
+      return res.status(403).json({
+        error: "YouTube requires sign-in (anti-bot). Provide cookies.",
+        code: "AUTH_REQUIRED",
+        checks: COOKIE_HEALTH,
+      });
+    }
     console.error("/prewarm error:", e.message);
-    res.status(500).json({ error: "Failed to prewarm", detail: e.message });
+    res.status(500).json({ error: "Failed to prewarm" });
   }
 });
 
-// Formats JSON (short private cache). Uses fast-first + tiny merge window.
+// Formats JSON
 app.get("/stream", async (req, res) => {
   try {
-    const id = String(req.query.id || "");
-    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
+    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
-    const cacheKey = `stream_${id}`;
+    const nocookie = /^1|true$/i.test(String(req.query.nocookie || ""));
+
+    const cacheKey = `stream_${nocookie ? "NC_" : ""}${id}`;
     const hit = cache.get(cacheKey);
     if (hit) {
       res.set("X-PT-Cache", "HIT");
@@ -509,16 +599,13 @@ app.get("/stream", async (req, res) => {
       return res.json(hit);
     }
 
-    // In-flight coalescing
     if (!inflight.has(cacheKey)) {
       inflight.set(cacheKey, (async () => {
-        const { info, client } = await fetchInfoMergedFast(id);
+        const { info, client } = await fetchInfoMergedFast(id, { nocookie });
         const result = buildFormats(info);
-        // cache briefly; URLs will be revalidated by their own expiry anyway
         cache.set(cacheKey, result, 60);
         return { result, client };
       })().finally(() => {
-        // remove after it resolves (allow next miss to refresh)
         setTimeout(() => inflight.delete(cacheKey), 0);
       }));
     }
@@ -528,18 +615,28 @@ app.get("/stream", async (req, res) => {
     setShortPrivate(res, 60);
     res.json(result);
   } catch (e) {
+    if (e?.code === "AUTH_REQUIRED") {
+      res.set("X-PT-Auth", "MISSING");
+      return res.status(403).json({
+        error: "YouTube requires sign-in (anti-bot). Provide cookies.",
+        code: "AUTH_REQUIRED",
+        checks: COOKIE_HEALTH,
+      });
+    }
     console.error("/stream error:", e.message);
-    res.status(500).json({ error: "Failed to fetch formats", detail: e.message });
+    res.status(500).json({ error: "Failed to fetch formats" });
   }
 });
 
-// Redirect to a merged MP4 close to 480p (uses URL expiry for TTL)
+// 480p redirect
 app.get("/stream480", async (req, res) => {
   try {
-    const id = String(req.query.id || "");
-    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
+    if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
+    if (!YT_ID.test(id)) return res.status(400).json({ error: "Missing/invalid video ID" });
 
-    const cacheKey = `stream480_${id}`;
+    const nocookie = /^1|true$/i.test(String(req.query.nocookie || ""));
+    const cacheKey = `stream480_${nocookie ? "NC_" : ""}${id}`;
     const cached = cache.get(cacheKey);
     if (cached) {
       res.set("X-PT-Cache", "HIT");
@@ -547,7 +644,7 @@ app.get("/stream480", async (req, res) => {
       return res.redirect(cached);
     }
 
-    const { info } = await fetchInfoMergedFast(id);
+    const { info } = await fetchInfoMergedFast(id, { nocookie });
     const fmt = pickBestMergedMp4(info, 480);
     if (fmt?.url) {
       const ttl = computeUrlTtlSec(fmt.url);
@@ -557,25 +654,31 @@ app.get("/stream480", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
-    const ttl = computeUrlTtlSec(url);
-    cache.set(cacheKey, url, ttl);
+    const { url: directUrl } = await spawnBestUrlAnyClient(`https://www.youtube.com/watch?v=${id}`, { nocookie });
+    const ttl = computeUrlTtlSec(directUrl);
+    cache.set(cacheKey, directUrl, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(url);
+    return res.redirect(directUrl);
   } catch (e) {
+    if (e?.code === "AUTH_REQUIRED") {
+      res.set("X-PT-Auth", "MISSING");
+      return res.status(403).json({ error: "Auth required for this video", code: "AUTH_REQUIRED", checks: COOKIE_HEALTH });
+    }
     console.error("/stream480 error:", e.message);
-    res.status(500).json({ error: "Failed to pick 480p stream", detail: e.message });
+    res.status(500).json({ error: "Failed to pick 480p stream" });
   }
 });
 
-// Redirect to best merged MP4 under ?max= (uses URL expiry for TTL)
+// Best MP4 under ?max=
 app.get("/streamMp4", async (req, res) => {
   try {
-    const id = String(req.query.id || "");
-    if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: "Bad id" });
+    if (rejectIfBusy(res)) return;
+    const id = String(req.query.id || "").trim().replace(/^\$/, "");
+    if (!YT_ID.test(id)) return res.status(400).json({ error: "Bad id" });
 
+    const nocookie = /^1|true$/i.test(String(req.query.nocookie || ""));
     const max = Math.max(144, Math.min(2160, parseInt(req.query.max || "720", 10) || 720));
-    const cacheKey = `mp4_${max}_${id}`;
+    const cacheKey = `mp4_${max}_${nocookie ? "NC_" : ""}${id}`;
     const cached = cache.get(cacheKey);
     if (cached) {
       res.set("X-PT-Cache", "HIT");
@@ -583,7 +686,7 @@ app.get("/streamMp4", async (req, res) => {
       return res.redirect(cached);
     }
 
-    const { info } = await fetchInfoMergedFast(id);
+    const { info } = await fetchInfoMergedFast(id, { nocookie });
     const fmt = pickBestMergedMp4(info, max);
     if (fmt?.url) {
       const ttl = computeUrlTtlSec(fmt.url);
@@ -593,20 +696,25 @@ app.get("/streamMp4", async (req, res) => {
       return res.redirect(fmt.url);
     }
 
-    const url = await spawnYtDlpBestUrl(`https://www.youtube.com/watch?v=${id}`, YT_CLIENTS[0]);
-    const ttl = computeUrlTtlSec(url);
-    cache.set(cacheKey, url, ttl);
+    const { url: directUrl } = await spawnBestUrlAnyClient(`https://www.youtube.com/watch?v=${id}`, { nocookie });
+    const ttl = computeUrlTtlSec(directUrl);
+    cache.set(cacheKey, directUrl, ttl);
     setCacheHeaders(res, ttl);
-    res.redirect(url);
+    return res.redirect(directUrl);
   } catch (e) {
+    if (e?.code === "AUTH_REQUIRED") {
+      res.set("X-PT-Auth", "MISSING");
+      return res.status(403).json({ error: "Auth required for this video", code: "AUTH_REQUIRED", checks: COOKIE_HEALTH });
+    }
     console.error("/streamMp4 error:", e.message);
     res.status(502).json({ error: e.message || "Failed to resolve MP4" });
   }
 });
 
-// Filter playable shorts (HLS-aware)
+// Filter playable shorts
 app.post("/filterPlayable", async (req, res) => {
   try {
+    if (rejectIfBusy(res)) return;
     const items = req.body?.items;
     if (!Array.isArray(items)) return res.status(400).json({ error: "Invalid input" });
 
@@ -620,8 +728,7 @@ app.post("/filterPlayable", async (req, res) => {
           const { info } = await fetchInfoMergedFast(id);
           const fmts = Array.isArray(info?.formats) ? info.formats : [];
           const hasHls = fmts.some((f) => looksLikeHls(pickUrl(f), f?.protocol, f?.ext));
-          if (hasHls) return id; // HLS masters are self-contained for Exo
-
+          if (hasHls) return id;
           const hasVideo = fmts.some((f) => f?.vcodec && f.vcodec !== "none" && pickUrl(f));
           const hasAudio = fmts.some((f) => f?.acodec && f.acodec !== "none" && pickUrl(f));
           return hasVideo && hasAudio ? id : null;
@@ -639,11 +746,21 @@ app.post("/filterPlayable", async (req, res) => {
     res.json({ playable });
   } catch (e) {
     console.error("/filterPlayable error:", e.message);
-    res.status(500).json({ error: "Failed to filter", detail: e.message });
+    res.status(500).json({ error: "Failed to filter" });
   }
 });
 
-// Listen on all interfaces so PaaS can reach it
+// ========= Graceful shutdown =========
+process.on("SIGTERM", () => {
+  for (const pid of [...children]) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  for (const pid of [...children]) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  process.exit(0);
+});
+
+// ========= Listen =========
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ yt-dlp server running on http://localhost:${PORT}`);
 });
