@@ -55,6 +55,42 @@ const B64    = process.env.YT_COOKIES_B64     || "";
 if (B64_GZ) console.log("env YT_COOKIES_B64_GZ length:", String(B64_GZ).length);
 if (B64)    console.log("env YT_COOKIES_B64 length:",    String(B64).length);
 
+// ---- Consent helpers (avoid EU consent gate on europe-west1 etc.) ---------------
+const FAR_FUTURE = 2145916800; // Jan 1, 2038
+
+/** Ensure EU consent cookies exist for google/youtube. */
+function ensureConsentCookies(text) {
+  const needConsent = !/\tCONSENT\t/.test(text);
+  const needSocs    = !/\tSOCS\t/.test(text);
+  if (!needConsent && !needSocs) return text;
+
+  const bases = [".youtube.com", ".google.com"];
+  const lines = [text.trimEnd()];
+  if (needConsent) {
+    for (const d of bases) lines.push(`${d}\tTRUE\t/\tTRUE\t${FAR_FUTURE}\tCONSENT\tYES+`);
+  }
+  if (needSocs) {
+    // Minimal SOCS value to suppress consent interstitial
+    for (const d of bases) lines.push(`${d}\tTRUE\t/\tTRUE\t${FAR_FUTURE}\tSOCS\tCAI`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** Pretty log which key cookies we actually have. */
+function logCookieSanity(txt) {
+  const want = [
+    "SID","__Secure-1PSID","__Secure-3PSID",
+    "HSID","SSID","APISID","SAPISID",
+    "__Secure-1PAPISID","__Secure-3PAPISID",
+    "CONSENT","SOCS","VISITOR_INFO1_LIVE"
+  ];
+  const present = want.filter(n => txt.includes(`\t${n}\t`));
+  console.log("🔎 Cookie sanity:", present.length ? present.join(", ") : "(none)");
+  if (!present.includes("CONSENT") || !present.includes("SOCS")) {
+    console.log("ℹ️  No CONSENT/SOCS found; adding generic consent to avoid EU interstitial.");
+  }
+}
+
 function decodeB64(s) {
   try { return Buffer.from(String(s).replace(/\s+/g, ""), "base64").toString("utf8"); }
   catch { return ""; }
@@ -73,6 +109,8 @@ function cookieScore(txt) {
   return hits * 100000 + txt.length; // hits first, then size
 }
 function writeTempCookies(text) {
+  // Add consent if missing (important for EU regions)
+  text = ensureConsentCookies(text);
   const tmpFile = path.join(os.tmpdir(), "youtube.cookies.txt");
   fs.writeFileSync(tmpFile, text, "utf8"); // NO FILTERING
   return tmpFile;
@@ -96,16 +134,23 @@ try {
   console.error("❌ Failed to materialize cookies:", e.message);
 }
 
-// Sanity log + size
+// Sanity log + size (and add consent even when using a mounted file)
 let HAS_COOKIES = false;
 if (YT_COOKIES_PATH) {
   try {
     const stat = fs.statSync(YT_COOKIES_PATH);
-    const txt = fs.readFileSync(YT_COOKIES_PATH, "utf8");
-    const want = ["SAPISID","__Secure-3PAPISID","CONSENT","SOCS"];
-    const present = want.filter(n => txt.includes(`\t${n}\t`));
+    let txt = fs.readFileSync(YT_COOKIES_PATH, "utf8");
+
+    const withConsent = ensureConsentCookies(txt);
+    if (withConsent !== txt) {
+      // don't mutate the original secret/file; write an effective copy
+      YT_COOKIES_PATH = writeTempCookies(withConsent);
+      console.log("🔧 Added generic consent cookies; using temp cookie file.");
+      txt = withConsent;
+    }
+
     console.log(`✅ Cookies loaded (${stat.size} bytes) from: ${YT_COOKIES_PATH}`);
-    console.log("🔎 Cookie sanity:", present.join(", ") || "(none)");
+    logCookieSanity(txt);
     HAS_COOKIES = true;
   } catch (e) {
     console.warn("⚠️ Cookies path set but unreadable:", e.message);
